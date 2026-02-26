@@ -1,0 +1,19 @@
+# Ignorar arquivos de dados (CSVs e Excel)
+*.csv
+*.xlsx
+*.xls
+*.txt
+
+# Ignorar arquivos de configuração ou dados estruturados
+*.json
+
+# Ignorar imagens geradas (gráficos, plots, etc)
+*.png
+*.jpg
+*.jpeg
+
+# Opcional: Ignorar pastas de ambiente virtual e cache do Python
+__pycache__/
+*.py[cod]
+venv/
+.env
