@@ -32,7 +32,7 @@ CONFIG = {
     "TABELA": "imoveis",
 
     # filtros do estudo (default)
-    "BAIRRO_ALVO": "ASA SUL",
+    "BAIRRO_ALVO": "ASA NORTE",
     "TIPO_ALVO": "APARTAMENTO",
     "OFERTA_ALVO": "VENDA",  # aceitos: VENDA, PUBLICADO, etc.
 

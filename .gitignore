@@ -11,6 +11,8 @@
 *.png
 *.jpg
 *.jpeg
+*.pdf
+*.docx
 
 # Opcional: Ignorar pastas de ambiente virtual e cache do Python
 __pycache__/
