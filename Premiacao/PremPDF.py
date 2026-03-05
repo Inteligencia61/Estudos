@@ -2,6 +2,7 @@
 import pandas as pd
 import numpy as np
 import os
+from datetime import datetime
 
 # Tenta importar gspread, mas permite execução local sem ele
 try:
@@ -27,7 +28,6 @@ def _to_float_br(x) -> float:
     """
     Função de conversão idêntica ao seu exemplo que funcionou.
     """
-    #print(x)
     if x is None:
         return 0.0
     if isinstance(x, (int, float)):
@@ -40,17 +40,15 @@ def _to_float_br(x) -> float:
         s = s.replace(".", "").replace(",", ".")
     elif "," in s and "." not in s:
         s = s.replace(",", ".")
-    #print(x)
     # Mantém apenas números, pontos e sinais de menos
     s = "".join(ch for ch in s if ch.isdigit() or ch in ".-")
-    
     try:
         return float(s)
     except:
         return 0.0
 
 def limpar_nome(n):
-    if pd.isna(n) or str(n).strip() in ["", "-", "nan", "NAN", "None"]: 
+    if pd.isna(n) or str(n).strip() in ["", "-", "nan", "NAN", "None"]:
         return ""
     return str(n).strip().upper()
 
@@ -114,7 +112,7 @@ def processar_rankings(df_subset, tipo_entidade='CORRETOR'):
         c_nomes = {n for n in c_nomes if n}
         todos_nomes = v_nomes | c_nomes
 
-        # --- RANKINGS VGV (mantém sua regra atual) ---
+        # --- RANKINGS VGV ---
         for n in v_nomes:
             vgv_vend[n] = vgv_vend.get(n, 0) + v_imovel
         for n in c_nomes:
@@ -122,8 +120,7 @@ def processar_rankings(df_subset, tipo_entidade='CORRETOR'):
         for n in todos_nomes:
             vgv_geral[n] = vgv_geral.get(n, 0) + v_imovel
 
-        # --- RANKINGS VGC (corrigido: divide por lado e por pessoa) ---
-
+        # --- RANKINGS VGC (divide por lado e por pessoa) ---
         tem_venda = len(v_nomes) > 0
         tem_capt = len(c_nomes) > 0
 
@@ -152,9 +149,7 @@ def processar_rankings(df_subset, tipo_entidade='CORRETOR'):
                 vgc_cap[n] = vgc_cap.get(n, 0) + por_captador
 
         # geral: soma exatamente o que cada um recebeu (sem duplicar total)
-        # (se alguém aparecer nos dois lados na mesma linha, ele acumula as duas parcelas)
         for n in v_nomes:
-            # pode não ter sido adicionado se parcela_venda=0
             if tem_venda and parcela_venda:
                 vgc_geral[n] = vgc_geral.get(n, 0) + (parcela_venda / len(v_nomes))
         for n in c_nomes:
@@ -175,9 +170,31 @@ def imprimir_ranking(titulo, dados):
     for n, v in sorted_dados:
         print(f"{n.ljust(30)} | R$ {v:14,.2f}")
 
+# ==========================================================
+# NOVO: COMBINAÇÃO (AC + PP) PARA GERAR O GERAL
+# ==========================================================
+def somar_rankings(*dicts: dict) -> dict:
+    """
+    Soma vários dicts {nome: valor}.
+    """
+    out = {}
+    for d in dicts:
+        if not d:
+            continue
+        for k, v in d.items():
+            out[k] = out.get(k, 0.0) + float(v or 0.0)
+    return out
 
-from datetime import datetime
+def combinar_resultados(res_a: dict, res_b: dict) -> dict:
+    """
+    Combina dois resultados no formato retornado por processar_rankings.
+    """
+    keys = ['VGV_CAP','VGV_VEND','VGV_GERAL','VGC_CAP','VGC_VEND','VGC_GERAL']
+    return {k: somar_rankings(res_a.get(k, {}), res_b.get(k, {})) for k in keys}
 
+# ==========================================================
+# TABELAS PARA EXPORTAÇÃO
+# ==========================================================
 def ranking_dict_to_df(d: dict, top_n: int = 30) -> pd.DataFrame:
     if not d:
         return pd.DataFrame(columns=["Pos", "Nome", "Valor"])
@@ -186,7 +203,7 @@ def ranking_dict_to_df(d: dict, top_n: int = 30) -> pd.DataFrame:
     df.insert(0, "Pos", range(1, len(df) + 1))
     return df
 
-def montar_tabelas_relatorio(res_esp, res_outros, res_gerentes, top_n=30):
+def montar_tabelas_relatorio(res_esp, res_outros, res_total, res_gerentes, top_n=30):
     """
     Retorna um dict {nome_da_secao: dataframe} pronto para exportar.
     """
@@ -210,6 +227,15 @@ def montar_tabelas_relatorio(res_esp, res_outros, res_gerentes, top_n=30):
     tabelas["CORRETORES_PP_VGC_VEND"]  = ranking_dict_to_df(res_outros["VGC_VEND"], top_n)
     tabelas["CORRETORES_PP_VGC_GERAL"] = ranking_dict_to_df(res_outros["VGC_GERAL"], top_n)
 
+    # NOVO: CORRETORES - GERAL (AC + PP)
+    tabelas["CORRETORES_GERAL_VGV_CAP"]   = ranking_dict_to_df(res_total["VGV_CAP"], top_n)
+    tabelas["CORRETORES_GERAL_VGV_VEND"]  = ranking_dict_to_df(res_total["VGV_VEND"], top_n)
+    tabelas["CORRETORES_GERAL_VGV_GERAL"] = ranking_dict_to_df(res_total["VGV_GERAL"], top_n)
+
+    tabelas["CORRETORES_GERAL_VGC_CAP"]   = ranking_dict_to_df(res_total["VGC_CAP"], top_n)
+    tabelas["CORRETORES_GERAL_VGC_VEND"]  = ranking_dict_to_df(res_total["VGC_VEND"], top_n)
+    tabelas["CORRETORES_GERAL_VGC_GERAL"] = ranking_dict_to_df(res_total["VGC_GERAL"], top_n)
+
     # GERENTES
     tabelas["GERENTES_VGV_GERAL"] = ranking_dict_to_df(res_gerentes["VGV_GERAL"], top_n)
     tabelas["GERENTES_VGC_GERAL"] = ranking_dict_to_df(res_gerentes["VGC_GERAL"], top_n)
@@ -218,14 +244,21 @@ def montar_tabelas_relatorio(res_esp, res_outros, res_gerentes, top_n=30):
 
     return tabelas
 
-
+# ==========================================================
+# EXPORTAÇÃO PDF / DOCX
+# ==========================================================
 def gerar_pdf(tabelas: dict, caminho_pdf: str, titulo: str):
     from reportlab.lib.pagesizes import A4
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
     from reportlab.lib.styles import getSampleStyleSheet
     from reportlab.lib import colors
 
-    doc = SimpleDocTemplate(caminho_pdf, pagesize=A4, rightMargin=36, leftMargin=36, topMargin=36, bottomMargin=36)
+    doc = SimpleDocTemplate(
+        caminho_pdf,
+        pagesize=A4,
+        rightMargin=36, leftMargin=36,
+        topMargin=36, bottomMargin=36
+    )
     styles = getSampleStyleSheet()
     story = []
 
@@ -240,7 +273,6 @@ def gerar_pdf(tabelas: dict, caminho_pdf: str, titulo: str):
             story.append(Spacer(1, 10))
             return
 
-        # Converte valores para formato monetário BR
         df2 = df.copy()
         df2["Valor"] = df2["Valor"].apply(lambda v: f"R$ {v:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
@@ -262,12 +294,10 @@ def gerar_pdf(tabelas: dict, caminho_pdf: str, titulo: str):
 
     for i, (secao, df) in enumerate(tabelas.items()):
         add_table(df, secao)
-        # quebra de página a cada 2-3 tabelas para ficar legível
         if (i + 1) % 3 == 0 and (i + 1) < len(tabelas):
             story.append(PageBreak())
 
     doc.build(story)
-
 
 def gerar_docx(tabelas: dict, caminho_docx: str, titulo: str):
     from docx import Document
@@ -292,7 +322,6 @@ def gerar_docx(tabelas: dict, caminho_docx: str, titulo: str):
             doc.add_paragraph("")
             continue
 
-        # Tabela
         table = doc.add_table(rows=1, cols=3)
         hdr_cells = table.rows[0].cells
         hdr_cells[0].text = "Pos"
@@ -309,7 +338,6 @@ def gerar_docx(tabelas: dict, caminho_docx: str, titulo: str):
 
     doc.save(caminho_docx)
 
-
 # ==========================================================
 # EXECUÇÃO
 # ==========================================================
@@ -323,27 +351,17 @@ def main(file_path=None):
             print(f"Erro ao carregar planilha: {e}")
             return
 
-    #df.columns = df.columns.str.strip()
-
-    # 1. Limpeza Financeira (Usando a função do seu exemplo)
-    #print(df['Valor_Negocio'])
-    #print(df['Valor_Total_61'])
+    # 1) Limpeza Financeira
     cols_fin = ['Valor_Negocio', 'Valor_Total_61']
     for col in cols_fin:
         if col in df.columns:
             df[col] = df[col].apply(_to_float_br)
 
-    # 2. Filtro de Data
+    # 2) Filtro de Data
     df['Data_Contrato'] = pd.to_datetime(df['Data_Contrato'], errors='coerce')
-    #df_mes = df[(df['Data_Contrato'].dt.month == MES_RELATORIO) & (df['Data_Contrato'].dt.year == ANO_RELATORIO)].copy()
-    df_mes = df[(df['Data_Contrato'] >= '2026-02-01') & (df['Data_Contrato'] <= '2026-02-28')]
-    #print(len(df_mes))
-    #print(df_mes['Valor_Negocio'])
-    som = 0
-    for a in df_mes['Valor_Negocio']:
-        som += a
-    #print(som)
-    # 3. Separação de Equipes
+    df_mes = df[(df['Data_Contrato'] >= '2026-01-01') & (df['Data_Contrato'] <= '2026-01-31')].copy()
+
+    # 3) Separação de Equipes (AC vs PP)
     def is_especial(row):
         gv = limpar_nome(row.get('Gerente_Venda_Nome'))
         gc = limpar_nome(row.get('Gerente_Captacao_Nome'))
@@ -353,17 +371,20 @@ def main(file_path=None):
     df_esp_raw = df_mes[mask_especial].copy()
     df_outros_raw = df_mes[~mask_especial].copy()
 
-    # 4. Processamento dos Grupos
+    # 4) Processamento dos Grupos
     res_esp = processar_rankings(df_esp_raw, 'CORRETOR')
     res_outros = processar_rankings(df_outros_raw, 'CORRETOR')
     res_gerentes = processar_rankings(df_mes, 'GERENTE')
 
-    # 5. Ajuste Fernanda Lindsay
+    # 5) Ajuste Fernanda Lindsay (sempre vai para "Outros"/PP)
     for rank_tipo in ['VGV_CAP', 'VGV_VEND', 'VGV_GERAL', 'VGC_CAP', 'VGC_VEND', 'VGC_GERAL']:
         for nome in EXCECAO_OUTROS:
             if nome in res_esp[rank_tipo]:
                 valor = res_esp[rank_tipo].pop(nome)
                 res_outros[rank_tipo][nome] = res_outros[rank_tipo].get(nome, 0) + valor
+
+    # 6) NOVO: Ranking GERAL (AC + PP)
+    res_total = combinar_resultados(res_esp, res_outros)
 
     # ==========================================================
     # EXIBIÇÃO DOS RANKINGS
@@ -382,6 +403,12 @@ def main(file_path=None):
     imprimir_ranking("VGV VENDA - PP", res_outros['VGV_VEND'])
     imprimir_ranking("VGV GERAL - PP", res_outros['VGV_GERAL'])
 
+    # NOVO: GERAL AC+PP (VGV)
+    print("\n>>> GERAL AC + PP (VGV)")
+    imprimir_ranking("VGV CAPTAÇÃO - GERAL", res_total['VGV_CAP'])
+    imprimir_ranking("VGV VENDA - GERAL", res_total['VGV_VEND'])
+    imprimir_ranking("VGV GERAL - GERAL", res_total['VGV_GERAL'])
+
     print("\n>>> EQUIPE HELIO / LUANA (VGC)")
     imprimir_ranking("VGC CAPTAÇÃO - AC", res_esp['VGC_CAP'])
     imprimir_ranking("VGC VENDA - AC", res_esp['VGC_VEND'])
@@ -392,19 +419,24 @@ def main(file_path=None):
     imprimir_ranking("VGC VENDA - PP", res_outros['VGC_VEND'])
     imprimir_ranking("VGC GERAL - PP", res_outros['VGC_GERAL'])
 
+    # NOVO: GERAL AC+PP (VGC)
+    print("\n>>> GERAL AC + PP (VGC)")
+    imprimir_ranking("VGC CAPTAÇÃO - GERAL", res_total['VGC_CAP'])
+    imprimir_ranking("VGC VENDA - GERAL", res_total['VGC_VEND'])
+    imprimir_ranking("VGC GERAL - GERAL", res_total['VGC_GERAL'])
+
     print("\n>>> RANKINGS GERENTES")
     imprimir_ranking("VGV GERAL - GERENTES", res_gerentes['VGV_GERAL'])
     imprimir_ranking("VGC GERAL - GERENTES", res_gerentes['VGC_GERAL'])
     imprimir_ranking("VGC CAPTAÇÃO - GERENTES", res_gerentes['VGC_CAP'])
     imprimir_ranking("VGC VENDA - GERENTES", res_gerentes['VGC_VEND'])
 
-
     # ==========================================================
     # GERAR ARQUIVOS (PDF e WORD)
     # ==========================================================
     titulo = f"Relatório de Rankings - {MES_RELATORIO:02d}/{ANO_RELATORIO}"
 
-    tabelas = montar_tabelas_relatorio(res_esp, res_outros, res_gerentes, top_n=TOP_N)
+    tabelas = montar_tabelas_relatorio(res_esp, res_outros, res_total, res_gerentes, top_n=TOP_N)
 
     gerar_pdf(tabelas, f"ranking_{ANO_RELATORIO}_{MES_RELATORIO:02d}.pdf", titulo)
     gerar_docx(tabelas, f"ranking_{ANO_RELATORIO}_{MES_RELATORIO:02d}.docx", titulo)
@@ -413,8 +445,6 @@ def main(file_path=None):
     print(f"- ranking_{ANO_RELATORIO}_{MES_RELATORIO:02d}.pdf")
     print(f"- ranking_{ANO_RELATORIO}_{MES_RELATORIO:02d}.docx")
 
-
-
 if __name__ == "__main__":
-    # main("/home/ubuntu/upload/CópiadeControledeContratos61Imóveis.xlsx")
+    # main("/caminho/para/arquivo.xlsx")
     main()
