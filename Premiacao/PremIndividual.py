@@ -87,7 +87,7 @@ def carregar_dados_sheets():
 
     client = autenticar_google_sheets()
 
-    sheet_id = "1SyyKK8dbL1-PKL364eA2B34Vxp6QJhbZ9qv94mFLmLI"
+    sheet_id = "1GLYIVuOG0heAXKxL5MdtjNxlR7o9N8BaWuvwHF9Jb0Y"
 
     planilha = client.open_by_key(sheet_id)
 
@@ -389,7 +389,7 @@ def main(file_path=None):
 
     df_mes=df[
         (df['Data_Contrato']>='2026-01-01') &
-        (df['Data_Contrato']<='2026-01-31')
+        (df['Data_Contrato']<='2026-03-06')
     ].copy()
 
     res_geral=processar_rankings(df_mes,'CORRETOR')

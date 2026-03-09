@@ -62,7 +62,7 @@ def autenticar_google_sheets():
 
 def carregar_dados_sheets():
     client = autenticar_google_sheets()
-    sheet_id = "1SyyKK8dbL1-PKL364eA2B34Vxp6QJhbZ9qv94mFLmLI"
+    sheet_id = "1GLYIVuOG0heAXKxL5MdtjNxlR7o9N8BaWuvwHF9Jb0Y"
 
     planilha = client.open_by_key(sheet_id)
     aba = planilha.get_worksheet(0)  # primeira aba
@@ -87,78 +87,93 @@ def carregar_dados_sheets():
 # LÓGICA DE PROCESSAMENTO DOS RANKINGS
 # ==========================================================
 def processar_rankings(df_subset, tipo_entidade='CORRETOR'):
+
     vgv_cap, vgv_vend, vgv_geral = {}, {}, {}
     vgc_cap, vgc_vend, vgc_geral = {}, {}, {}
 
     for _, row in df_subset.iterrows():
-        v_imovel = row.get('Valor_Negocio', 0) or 0
-        v_comissao_total = row.get('Valor_Total_61', 0) or 0
 
-        # --- nomes por papel ---
+        v_imovel = row.get('Valor_Negocio',0) or 0
+        v_comissao_total = row.get('Valor_Total_61',0) or 0
+
         if tipo_entidade == 'CORRETOR':
+
             v_nomes = {
                 limpar_nome(row.get('Corretor_Venda_1_Nome')),
                 limpar_nome(row.get('Corretor_Venda_2_Nome')),
             }
+
             c_nomes = {
                 limpar_nome(row.get('Corretor_Captador_1_Nome')),
                 limpar_nome(row.get('Corretor_Captador_2_Nome')),
             }
+
         else:
-            v_nomes = {limpar_nome(row.get('Gerente_Venda_Nome'))}
-            c_nomes = {limpar_nome(row.get('Gerente_Captacao_Nome'))}
 
-        v_nomes = {n for n in v_nomes if n}
-        c_nomes = {n for n in c_nomes if n}
-        todos_nomes = v_nomes | c_nomes
+            v_nomes={limpar_nome(row.get('Gerente_Venda_Nome'))}
+            c_nomes={limpar_nome(row.get('Gerente_Captacao_Nome'))}
 
-        # --- RANKINGS VGV ---
+        v_nomes={n for n in v_nomes if n}
+        c_nomes={n for n in c_nomes if n}
+
+        todos=v_nomes|c_nomes
+
         for n in v_nomes:
-            vgv_vend[n] = vgv_vend.get(n, 0) + v_imovel
-        for n in c_nomes:
-            vgv_cap[n] = vgv_cap.get(n, 0) + v_imovel
-        for n in todos_nomes:
-            vgv_geral[n] = vgv_geral.get(n, 0) + v_imovel
+            vgv_vend[n]=vgv_vend.get(n,0)+v_imovel
 
-        # --- RANKINGS VGC (divide por lado e por pessoa) ---
-        tem_venda = len(v_nomes) > 0
-        tem_capt = len(c_nomes) > 0
+        for n in c_nomes:
+            vgv_cap[n]=vgv_cap.get(n,0)+v_imovel
+
+        for n in todos:
+            vgv_geral[n]=vgv_geral.get(n,0)+v_imovel
+
+
+        tem_venda=len(v_nomes)>0
+        tem_capt=len(c_nomes)>0
 
         if tem_venda and tem_capt:
-            parcela_venda = v_comissao_total * 0.5
-            parcela_capt = v_comissao_total * 0.5
-        elif tem_venda and not tem_capt:
-            parcela_venda = v_comissao_total
-            parcela_capt = 0.0
-        elif tem_capt and not tem_venda:
-            parcela_venda = 0.0
-            parcela_capt = v_comissao_total
-        else:
-            parcela_venda = 0.0
-            parcela_capt = 0.0
+            parcela_venda=v_comissao_total*0.5
+            parcela_capt=v_comissao_total*0.5
 
-        # divide igualmente entre as pessoas de cada lado
+        elif tem_venda:
+            parcela_venda=v_comissao_total
+            parcela_capt=0
+
+        elif tem_capt:
+            parcela_venda=0
+            parcela_capt=v_comissao_total
+
+        else:
+            parcela_venda=parcela_capt=0
+
+
         if tem_venda and parcela_venda:
-            por_vendedor = parcela_venda / len(v_nomes)
+
+            por_vendedor=parcela_venda/len(v_nomes)
+
             for n in v_nomes:
-                vgc_vend[n] = vgc_vend.get(n, 0) + por_vendedor
+
+                vgc_vend[n]=vgc_vend.get(n,0)+por_vendedor
+                vgc_geral[n]=vgc_geral.get(n,0)+por_vendedor
+
 
         if tem_capt and parcela_capt:
-            por_captador = parcela_capt / len(c_nomes)
-            for n in c_nomes:
-                vgc_cap[n] = vgc_cap.get(n, 0) + por_captador
 
-        # geral: soma exatamente o que cada um recebeu (sem duplicar total)
-        for n in v_nomes:
-            if tem_venda and parcela_venda:
-                vgc_geral[n] = vgc_geral.get(n, 0) + (parcela_venda / len(v_nomes))
-        for n in c_nomes:
-            if tem_capt and parcela_capt:
-                vgc_geral[n] = vgc_geral.get(n, 0) + (parcela_capt / len(c_nomes))
+            por_capt=parcela_capt/len(c_nomes)
+
+            for n in c_nomes:
+
+                vgc_cap[n]=vgc_cap.get(n,0)+por_capt
+                vgc_geral[n]=vgc_geral.get(n,0)+por_capt
+
 
     return {
-        'VGV_CAP': vgv_cap, 'VGV_VEND': vgv_vend, 'VGV_GERAL': vgv_geral,
-        'VGC_CAP': vgc_cap, 'VGC_VEND': vgc_vend, 'VGC_GERAL': vgc_geral
+        'VGV_CAP':vgv_cap,
+        'VGV_VEND':vgv_vend,
+        'VGV_GERAL':vgv_geral,
+        'VGC_CAP':vgc_cap,
+        'VGC_VEND':vgc_vend,
+        'VGC_GERAL':vgc_geral
     }
 
 def imprimir_ranking(titulo, dados):
@@ -389,19 +404,19 @@ def main(file_path=None):
     # ==========================================================
     # EXIBIÇÃO DOS RANKINGS
     # ==========================================================
-    print(f"\n{'#'*60}")
-    print(f" RELATÓRIO DE RANKINGS - {MES_RELATORIO}/{ANO_RELATORIO}")
-    print(f"{'#'*60}")
+    #print(f"\n{'#'*60}")
+    #print(f" RELATÓRIO DE RANKINGS - {MES_RELATORIO}/{ANO_RELATORIO}")
+    #print(f"{'#'*60}")
 
-    print("\n>>> EQUIPE HELIO / LUANA (VGV)")
-    imprimir_ranking("VGV CAPTAÇÃO - AC", res_esp['VGV_CAP'])
-    imprimir_ranking("VGV VENDA - AC", res_esp['VGV_VEND'])
-    imprimir_ranking("VGV GERAL - AC", res_esp['VGV_GERAL'])
+    #print("\n>>> EQUIPE HELIO / LUANA (VGV)")
+    #imprimir_ranking("VGV CAPTAÇÃO - AC", res_esp['VGV_CAP'])
+    #imprimir_ranking("VGV VENDA - AC", res_esp['VGV_VEND'])
+    #imprimir_ranking("VGV GERAL - AC", res_esp['VGV_GERAL'])
 
-    print("\n>>> EQUIPE OUTROS (VGV)")
-    imprimir_ranking("VGV CAPTAÇÃO - PP", res_outros['VGV_CAP'])
-    imprimir_ranking("VGV VENDA - PP", res_outros['VGV_VEND'])
-    imprimir_ranking("VGV GERAL - PP", res_outros['VGV_GERAL'])
+    #print("\n>>> EQUIPE OUTROS (VGV)")
+    #imprimir_ranking("VGV CAPTAÇÃO - PP", res_outros['VGV_CAP'])
+    #imprimir_ranking("VGV VENDA - PP", res_outros['VGV_VEND'])
+    #imprimir_ranking("VGV GERAL - PP", res_outros['VGV_GERAL'])
 
     # NOVO: GERAL AC+PP (VGV)
     print("\n>>> GERAL AC + PP (VGV)")
@@ -409,15 +424,15 @@ def main(file_path=None):
     imprimir_ranking("VGV VENDA - GERAL", res_total['VGV_VEND'])
     imprimir_ranking("VGV GERAL - GERAL", res_total['VGV_GERAL'])
 
-    print("\n>>> EQUIPE HELIO / LUANA (VGC)")
-    imprimir_ranking("VGC CAPTAÇÃO - AC", res_esp['VGC_CAP'])
-    imprimir_ranking("VGC VENDA - AC", res_esp['VGC_VEND'])
-    imprimir_ranking("VGC GERAL - AC", res_esp['VGC_GERAL'])
+    #print("\n>>> EQUIPE HELIO / LUANA (VGC)")
+    #imprimir_ranking("VGC CAPTAÇÃO - AC", res_esp['VGC_CAP'])
+    #imprimir_ranking("VGC VENDA - AC", res_esp['VGC_VEND'])
+    #imprimir_ranking("VGC GERAL - AC", res_esp['VGC_GERAL'])
 
-    print("\n>>> EQUIPE OUTROS (VGC)")
-    imprimir_ranking("VGC CAPTAÇÃO - PP", res_outros['VGC_CAP'])
-    imprimir_ranking("VGC VENDA - PP", res_outros['VGC_VEND'])
-    imprimir_ranking("VGC GERAL - PP", res_outros['VGC_GERAL'])
+    #print("\n>>> EQUIPE OUTROS (VGC)")
+    #imprimir_ranking("VGC CAPTAÇÃO - PP", res_outros['VGC_CAP'])
+    #imprimir_ranking("VGC VENDA - PP", res_outros['VGC_VEND'])
+    #imprimir_ranking("VGC GERAL - PP", res_outros['VGC_GERAL'])
 
     # NOVO: GERAL AC+PP (VGC)
     print("\n>>> GERAL AC + PP (VGC)")
@@ -425,11 +440,11 @@ def main(file_path=None):
     imprimir_ranking("VGC VENDA - GERAL", res_total['VGC_VEND'])
     imprimir_ranking("VGC GERAL - GERAL", res_total['VGC_GERAL'])
 
-    print("\n>>> RANKINGS GERENTES")
-    imprimir_ranking("VGV GERAL - GERENTES", res_gerentes['VGV_GERAL'])
-    imprimir_ranking("VGC GERAL - GERENTES", res_gerentes['VGC_GERAL'])
-    imprimir_ranking("VGC CAPTAÇÃO - GERENTES", res_gerentes['VGC_CAP'])
-    imprimir_ranking("VGC VENDA - GERENTES", res_gerentes['VGC_VEND'])
+    #print("\n>>> RANKINGS GERENTES")
+    #imprimir_ranking("VGV GERAL - GERENTES", res_gerentes['VGV_GERAL'])
+    #imprimir_ranking("VGC GERAL - GERENTES", res_gerentes['VGC_GERAL'])
+    #imprimir_ranking("VGC CAPTAÇÃO - GERENTES", res_gerentes['VGC_CAP'])
+    #imprimir_ranking("VGC VENDA - GERENTES", res_gerentes['VGC_VEND'])
 
     # ==========================================================
     # GERAR ARQUIVOS (PDF e WORD)

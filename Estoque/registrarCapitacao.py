@@ -1,28 +1,7 @@
-# captacao_auto_to_sheets.py
+# captacao_csv_to_sheets.py
 # ============================================================
 # Automação 100% em Python -> Google Sheets
-#
-# O que este script faz:
-# 1) Lê uma lista de códigos (XLSX com coluna "Código" OU lista no script)
-# 2) Consulta o Imoview (endpoint de VAGOS/DISPONÍVEIS)
-#    - Atenção: se o imóvel NÃO estiver vago/disponível, ele pode NÃO retornar,
-#      mesmo você passando o código. Por isso criamos um relatório de "faltantes".
-# 3) Resolve dimensões no Google Sheets:
-#    - Dim_Bairro (cria se não existir)
-#    - Dim_Tipo (mapeia por Nome)
-#    - Dim_Corretor:
-#        * tenta mapear captador por IdImoview -> IdCorretor
-#        * se não houver Id no JSON do captador, tenta mapear por Nome (fallback)
-#        * se mesmo assim não achar, grava o "id" do Imoview que veio (fallback final)
-# 4) Upsert em:
-#    - Dim_Imovel: Código | Tipo | Valor | Bairro | Foco PP | Foco AC
-#    - Fato_Captacao: Código | Captador1 | Captador2 | Captador3 | Gerente | DataEntrada
-# 5) Gera arquivos:
-#    - codigos_nao_retornaram.csv   (códigos que estavam no XLSX mas não voltaram do endpoint)
-#    - codigos_retornados.csv       (códigos que voltaram)
-#
-# Requisitos:
-#   pip install pandas google-api-python-client google-auth openpyxl requests python-dateutil
+# Lendo os imóveis a partir de CSV, e não mais da API
 # ============================================================
 
 import os
@@ -30,7 +9,6 @@ import re
 from datetime import datetime, date
 from typing import Dict, List, Any, Optional, Tuple
 
-import requests
 import pandas as pd
 from dateutil.parser import parse as dateparse
 
@@ -43,39 +21,26 @@ from googleapiclient.discovery import build
 # =========================
 
 # --- Google Sheets ---
-CREDENTIALS_JSON = r"./credentiasl_machome.json"  # caminho do JSON do service account
+CREDENTIALS_JSON = r"../cred.json"
 SPREADSHEET_ID = "1HQDdcbUMj276hnIbPs-WwdWHiUPzMhPRWt4HHRyYGnw"
 
-# --- Imoview ---
-IMOVIEW_CHAVE = "a4ff7c378eff87533b123d25c9b6f088"  # header: chave
+# --- CSV de entrada ---
+CSV_PATH = r"../data/captacoes-imoveis.csv"
+CSV_SEP = ";"
+CSV_ENCODING = "utf-8-sig"
 
-# Endpoint de "imóveis vagos/disponíveis"
-IMOVIEW_PATH = "/Imovel/RetornarImoveisDisponiveis"
+# --- Filtros opcionais do CSV ---
+FILTRAR_FINALIDADE = "Venda"    # ex: "Venda" / "Aluguel" / "" para não filtrar
+FILTRAR_DESTINACAO = ""         # ex: "Residencial" / "Comercial" / "" para não filtrar
 
-# --- Finalidade ---
-FINALIDADE = 2  # 1=ALUGUEL, 2=VENDA
-
-# --- Como o script vai buscar os imóveis? ---
-# Escolha UM modo (deixe os outros vazios)
-
-# MODO 1: Lista de códigos direto no script
-CODES_LIST: List[int] = []  # ex: [12345, 67890]
-
-# MODO 2: XLSX com coluna "Código"
-CODES_XLSX_PATH = "./entrada.xlsx"  # ex: r"C:\Users\...\entrada_codigos.xlsx"
+# --- Como o script vai filtrar os imóveis? ---
+CODES_LIST: List[int] = []      # ex: [11854, 11870]
+CODES_XLSX_PATH = ""            # ex: "./entrada.xlsx"
 CODES_XLSX_SHEET = "Página1"
 
-# MODO 3: Janela de data no Imoview (dd/mm/yyyy)
-# DATE_FROM = "06/02/2026"
-# DATE_TO = "12/02/2026"
-
-# --- Filtros OPCIONAIS da API (deixe None/""/0 para não filtrar) ---
-DESTINACAO = 0  # 1=Residencial, 2=Comercial, ... ou 0=Todos
-CODIGO_UNIDADE = ""  # ex: "12" ou "12,13" ou "" para todas
-SOMENTE_COM_URL_PUBLICA = False  # True/False (opcional)
-
-# --- Paginação ---
-NUM_REGISTROS = 20  # máximo 20 conforme doc
+# --- Se quiser filtrar por data do CSV, descomente ---
+# DATE_FROM = "01/03/2026"
+# DATE_TO = "06/03/2026"
 
 
 # =========================
@@ -90,12 +55,15 @@ BAIRROS_PP_RAW = {
     "JARDIM BOTANICO",
     "LAGO NORTE",
     "LAGO SUL",
+    "SETOR SUDOESTE",
 }
 
 BAIRROS_AC_RAW = {
     "Águas Claras Norte",
     "Águas Claras Sul",
     "Norte (Águas Claras)",
+    "Sul (Águas Claras)",
+    "Águas Claras",
 }
 
 MIN_COMISSAO = 3.5
@@ -130,10 +98,14 @@ BAIRROS_AC = {norm(x) for x in BAIRROS_AC_RAW}
 def to_float(x: Any) -> float:
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return 0.0
+
+    if isinstance(x, bool):
+        return 1.0 if x else 0.0
+
     if isinstance(x, (int, float)):
         return float(x)
 
-    s = str(x).strip()
+    s = str(x).strip().replace("'", "")
     if not s:
         return 0.0
 
@@ -156,7 +128,12 @@ def to_int(x: Any) -> Optional[int]:
     try:
         if x is None or (isinstance(x, float) and pd.isna(x)):
             return None
-        return int(float(str(x).strip()))
+
+        s = str(x).strip().replace("'", "")
+        if not s:
+            return None
+
+        return int(float(s))
     except Exception:
         return None
 
@@ -164,13 +141,17 @@ def to_int(x: Any) -> Optional[int]:
 def parse_date_any(x: Any) -> Optional[date]:
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return None
+
     if isinstance(x, date) and not isinstance(x, datetime):
         return x
+
     if isinstance(x, datetime):
         return x.date()
-    s = str(x).strip()
+
+    s = str(x).strip().replace("'", "")
     if not s:
         return None
+
     try:
         d = dateparse(s, dayfirst=True, fuzzy=True)
         return d.date()
@@ -178,221 +159,157 @@ def parse_date_any(x: Any) -> Optional[date]:
         return None
 
 
-def chunk_list(xs: List[int], size: int) -> List[List[int]]:
+def parse_bool_any(x: Any) -> bool:
+    if isinstance(x, bool):
+        return x
+
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return False
+
+    s = str(x).strip().replace("'", "").upper()
+
+    if s in {"TRUE", "VERDADEIRO", "1", "SIM"}:
+        return True
+    if s in {"FALSE", "FALSO", "0", "NAO", "NÃO", ""}:
+        return False
+
+    return False
+
+
+def unique_keep_order(lst: List[str]) -> List[str]:
+    seen = set()
     out = []
-    for i in range(0, len(xs), size):
-        out.append(xs[i:i + size])
+    for x in lst:
+        x = str(x).strip()
+        if x and x.lower() != "nan" and x not in seen:
+            seen.add(x)
+            out.append(x)
     return out
+
+
+def split_captadores(raw: Any) -> List[str]:
+    """
+    Exemplos de conteúdo da coluna Captadores:
+    - "Luana Salvinski"
+    - "Fernando Borges | Filipe Brandão"
+    - "Nome 1; Nome 2"
+    """
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return []
+
+    s = str(raw).strip()
+    if not s:
+        return []
+
+    partes = re.split(r"\s*\|\s*|\s*;\s*|\s*,\s*|/\s*", s)
+    partes = [p.strip() for p in partes if p and p.strip()]
+    return unique_keep_order(partes)[:3]
+
+
+def normalize_date_for_sheets(x: Any) -> str:
+    d = parse_date_any(x)
+    if d:
+        return d.strftime("%d/%m/%Y")
+    return ""
+
+
+def cell_to_sheet_value(x: Any):
+    if x is None:
+        return ""
+
+    if isinstance(x, float) and pd.isna(x):
+        return ""
+
+    if isinstance(x, (datetime, date)):
+        return x.strftime("%d/%m/%Y")
+
+    if isinstance(x, str):
+        # remove apóstrofo inicial que pode contaminar a planilha
+        if x.startswith("'"):
+            x = x[1:]
+        return x
+
+    return x
 
 
 # =========================
-# IMOVIEW
+# CSV
 # =========================
-def _get_imoview_chave() -> str:
-    chave = os.getenv("IMOVIEW_CHAVE") or IMOVIEW_CHAVE
-    if not chave:
-        raise RuntimeError("Imoview: defina IMOVIEW_CHAVE (ENV ou seção CONFIG).")
-    return chave
+def load_csv_as_df(csv_path: str) -> pd.DataFrame:
+    if not os.path.exists(csv_path):
+        raise RuntimeError(f"CSV não encontrado: {csv_path}")
+
+    df = pd.read_csv(
+        csv_path,
+        sep=CSV_SEP,
+        encoding=CSV_ENCODING,
+        engine="python"
+    )
+
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+    return df
 
 
-def imoview_post(path: str, payload: dict) -> dict:
-    chave = _get_imoview_chave()
-    url = f"https://api.imoview.com.br{path}"
-    headers = {"chave": chave}
-    r = requests.post(url, json=payload, headers=headers, timeout=90)
-    if not r.ok:
-        raise RuntimeError(f"Imoview erro {r.status_code}: {r.text[:1200]}")
-    return r.json()
+def load_codes_from_xlsx(xlsx_path: str, sheet_name: str) -> List[int]:
+    df = pd.read_excel(xlsx_path, sheet_name=sheet_name)
+
+    col = None
+    for c in df.columns:
+        if norm(c) in {"CODIGO", "CÓDIGO"}:
+            col = c
+            break
+
+    if col is None:
+        raise RuntimeError("No XLSX, a aba indicada precisa ter uma coluna 'Código'.")
+
+    df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
+    df = df.dropna(subset=[col])
+    return sorted(df[col].astype(int).unique().tolist())
 
 
-def fetch_imoveis_by_codes(codes: List[int], finalidade: int) -> Dict[int, dict]:
-    """
-    IMPORTANTE:
-    - O endpoint é de VAGOS/DISPONÍVEIS. Se o código não estiver vago/disponível,
-      pode NÃO retornar (isso é normal).
-    - numeroregistros máximo 20 -> fazemos em lotes.
-    """
-    codes = sorted(set([int(x) for x in codes if x is not None]))
-    if not codes:
-        return {}
+def filter_df_by_config(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
 
-    out: Dict[int, dict] = {}
-    for part in chunk_list(codes, NUM_REGISTROS):
-        codes_str = ",".join(str(x) for x in part)
-        payload = {
-            "finalidade": int(finalidade),
-            "numeroPagina": 1,
-            "numeroRegistros": int(NUM_REGISTROS),
-            "codigosimoveis": codes_str,
-            "exibircaptadores": True,
-        }
+    if FILTRAR_FINALIDADE and "Finalidade" in out.columns:
+        out = out[
+            out["Finalidade"].astype(str).str.strip().str.upper() ==
+            FILTRAR_FINALIDADE.strip().upper()
+        ]
 
-        # filtros opcionais (conforme sua doc)
-        if DESTINACAO and int(DESTINACAO) != 0:
-            payload["destinacao"] = int(DESTINACAO)
-        if CODIGO_UNIDADE:
-            payload["codigounidade"] = str(CODIGO_UNIDADE)
-        if SOMENTE_COM_URL_PUBLICA:
-            payload["somentecomurlpublica"] = True
+    if FILTRAR_DESTINACAO and "Destinacao" in out.columns:
+        out = out[
+            out["Destinacao"].astype(str).str.strip().str.upper() ==
+            FILTRAR_DESTINACAO.strip().upper()
+        ]
 
-        resp = imoview_post(IMOVIEW_PATH, payload)
-        lista = resp.get("lista") or []
-        for item in lista:
-            c = to_int(item.get("codigo"))
-            if c is not None:
-                out[c] = item
+    if "DATE_FROM" in globals() and "DATE_TO" in globals():
+        d1 = parse_date_any(globals()["DATE_FROM"])
+        d2 = parse_date_any(globals()["DATE_TO"])
+
+        if "DataCadastro" in out.columns and d1 and d2:
+            out["_data_csv"] = out["DataCadastro"].apply(parse_date_any)
+            out = out[(out["_data_csv"] >= d1) & (out["_data_csv"] <= d2)]
+            out = out.drop(columns=["_data_csv"], errors="ignore")
 
     return out
 
 
-def fetch_imoveis_by_date(date_from_ddmmyyyy: str, date_to_ddmmyyyy: str, finalidade: int) -> Dict[int, dict]:
-    page = 1
-    out: Dict[int, dict] = {}
-    while True:
-        payload = {
-            "finalidade": int(finalidade),
-            "numeroPagina": page,
-            "numeroRegistros": int(NUM_REGISTROS),
-            # "datacadastroinicio": date_from_ddmmyyyy,
-            # "datacadastrofim": date_to_ddmmyyyy,
-            "ordenacao": "datainclusaodesc",
-            "exibircaptadores": True,
-        }
+def extract_fields_from_csv_row(row: pd.Series) -> dict:
+    codigo = to_int(row.get("Codigo")) or 0
+    bairro_nome = row.get("Bairro", "") or ""
+    valor = row.get("Valor", 0)
+    tipo_nome = row.get("Tipo", "") or ""
+    comissao_pct = row.get("ComissaoVenda", 0)
 
-        if DESTINACAO and int(DESTINACAO) != 0:
-            payload["destinacao"] = int(DESTINACAO)
-        if CODIGO_UNIDADE:
-            payload["codigounidade"] = str(CODIGO_UNIDADE)
-        if SOMENTE_COM_URL_PUBLICA:
-            payload["somentecomurlpublica"] = True
-
-        resp = imoview_post(IMOVIEW_PATH, payload)
-        lista = resp.get("lista") or []
-        if not lista:
-            break
-
-        for item in lista:
-            c = to_int(item.get("codigo"))
-            if c is not None:
-                out[c] = item
-
-        if len(lista) < NUM_REGISTROS:
-            break
-        page += 1
-
-    return out
-
-
-def extract_fields(item: dict) -> dict:
-    codigo = to_int(item.get("codigo")) or 0
-
-    bairro_nome = (
-        item.get("bairro")
-        or item.get("nomebairro")
-        or item.get("bairronome")
-        or (item.get("bairroobj") or {}).get("nome")
-        or ""
-    )
-
-    valor = (
-        item.get("valor")
-        or item.get("valorvenda")
-        or item.get("preco")
-        or item.get("valorimovel")
-        or 0
-    )
-
-    tipo_nome = (
-        item.get("tipo")
-        or item.get("nometipo")
-        or item.get("tipoimovel")
-        or (item.get("tipoobj") or {}).get("nome")
-        or ""
-    )
-
-    comissao_pct = (
-        item.get("taxacomissao")  # aparece no schema
-        or item.get("taxaComissao")
-        or item.get("comissao")
-        or item.get("percentualcomissao")
-        or item.get("percentualComissao")
-        or item.get("comissaopercentual")
-        or 0
-    )
-
-    # Pelo schema: datahoracadastro / datahoraultimaalteracao etc.
-    # A gente tenta pegar algo que pareça "data de entrada".
     data_entrada = (
-        item.get("datahoracadastro")
-        or item.get("datacadastro")
-        or item.get("dataCadastro")
-        or item.get("datainclusao")
-        or item.get("dataInclusao")
-        or item.get("data")
-        or item.get("dataentrada")
-        or item.get("dataEntrada")
+        row.get("DataCadastro")
+        or row.get("DataHoraUltimaAlteracao")
+        or row.get("DataHoraUltimaSituacao")
         or None
     )
 
-    captadores_raw = item.get("captadores") or item.get("listaCaptadores") or item.get("captador") or []
-
-    # Schema oficial não traz id no captador, mas seu retorno anterior trouxe ['46'] etc.
-    # Então:
-    # - se vier id/codigo -> usamos
-    # - se não vier -> usamos nome (para mapear com Dim_Corretor por nome)
-    captador_ids: List[str] = []
-    captador_nomes: List[str] = []
-
-    if isinstance(captadores_raw, list):
-        for c in captadores_raw:
-            if isinstance(c, dict):
-                cid = (
-                    c.get("id")
-                    or c.get("idCorretor")
-                    or c.get("codigocaptador")
-                    or c.get("codigo")
-                    or c.get("IdCorretor")
-                    or c.get("idimoview")
-                    or c.get("IdImoview")
-                )
-                if cid is not None and str(cid).strip():
-                    captador_ids.append(str(cid).strip())
-
-                nome = c.get("nome")
-                if nome is not None and str(nome).strip():
-                    captador_nomes.append(str(nome).strip())
-            else:
-                # pode vir direto "46" (string/int)
-                captador_ids.append(str(c).strip())
-
-    elif isinstance(captadores_raw, dict):
-        cid = (
-            captadores_raw.get("id")
-            or captadores_raw.get("idCorretor")
-            or captadores_raw.get("codigocaptador")
-            or captadores_raw.get("codigo")
-            or captadores_raw.get("idimoview")
-            or captadores_raw.get("IdImoview")
-        )
-        if cid is not None and str(cid).strip():
-            captador_ids.append(str(cid).strip())
-        nome = captadores_raw.get("nome")
-        if nome is not None and str(nome).strip():
-            captador_nomes.append(str(nome).strip())
-
-    # unique preservando ordem
-    def unique_keep_order(lst: List[str]) -> List[str]:
-        seen = set()
-        out2 = []
-        for x in lst:
-            x = str(x).strip()
-            if x and x.lower() != "nan" and x not in seen:
-                seen.add(x)
-                out2.append(x)
-        return out2
-
-    captador_ids = unique_keep_order(captador_ids)[:3]
-    captador_nomes = unique_keep_order(captador_nomes)[:3]
+    captadores_raw = row.get("Captadores", "")
+    captador_nomes = split_captadores(captadores_raw)
 
     return {
         "codigo": codigo,
@@ -401,9 +318,21 @@ def extract_fields(item: dict) -> dict:
         "tipo_nome": str(tipo_nome),
         "comissao_pct": to_float(comissao_pct),
         "data_entrada": parse_date_any(data_entrada),
-        "captador_ids": captador_ids,
+        "captador_ids": [],
         "captador_nomes": captador_nomes,
     }
+
+
+def build_imoveis_from_csv(df: pd.DataFrame) -> Dict[int, dict]:
+    out: Dict[int, dict] = {}
+
+    for _, row in df.iterrows():
+        codigo = to_int(row.get("Codigo"))
+        if codigo is None:
+            continue
+        out[int(codigo)] = row.to_dict()
+
+    return out
 
 
 # =========================
@@ -413,13 +342,15 @@ def classificar_foco(bairro_nome: str, valor: float, comissao_pct: float, is_res
     b = norm(bairro_nome)
     v = float(valor or 0)
     c = float(comissao_pct or 0)
+
     foco_pp = (b in BAIRROS_PP) and (v >= MIN_VALOR_PP) and (c >= MIN_COMISSAO) and is_residencial
     foco_ac = (b in BAIRROS_AC) and (v >= MIN_VALOR_AC) and (c >= MIN_COMISSAO) and is_residencial
+
     return foco_pp, foco_ac
 
 
 # =========================
-# GOOGLE SHEETS (API)
+# GOOGLE SHEETS
 # =========================
 def sheets_service(credentials_json: str):
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -429,28 +360,73 @@ def sheets_service(credentials_json: str):
 
 def read_sheet_as_df(svc, spreadsheet_id: str, sheet_name: str) -> pd.DataFrame:
     rng = f"{sheet_name}!A:Z"
-    res = svc.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=rng).execute()
+    res = svc.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=rng
+    ).execute()
+
     values = res.get("values", [])
     if not values:
         return pd.DataFrame()
+
     header = values[0]
     rows = values[1:]
     fixed = [r + [""] * (len(header) - len(r)) for r in rows]
     return pd.DataFrame(fixed, columns=header)
 
 
+def normalize_dim_imovel_types(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if "Código" in df.columns:
+        df["Código"] = df["Código"].apply(lambda x: to_int(x) if str(x).strip() != "" else "")
+
+    if "Valor" in df.columns:
+        df["Valor"] = df["Valor"].apply(lambda x: to_float(x) if str(x).strip() != "" else "")
+
+    if "Foco PP" in df.columns:
+        df["Foco PP"] = df["Foco PP"].apply(parse_bool_any)
+
+    if "Foco AC" in df.columns:
+        df["Foco AC"] = df["Foco AC"].apply(parse_bool_any)
+
+    return df
+
+
+def normalize_fato_captacao_types(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if "Código" in df.columns:
+        df["Código"] = df["Código"].apply(lambda x: to_int(x) if str(x).strip() != "" else "")
+
+    if "DataEntrada" in df.columns:
+        df["DataEntrada"] = df["DataEntrada"].apply(normalize_date_for_sheets)
+
+    return df
+
+
 def write_df_over_sheet(svc, spreadsheet_id: str, sheet_name: str, df: pd.DataFrame):
-    values = [list(df.columns)] + df.astype(object).where(pd.notnull(df), "").values.tolist()
+    df = df.copy()
+
+    if sheet_name == "Dim_Imovel":
+        df = normalize_dim_imovel_types(df)
+    elif sheet_name == "Fato_Captacao":
+        df = normalize_fato_captacao_types(df)
+
+    values = [list(df.columns)]
+    for _, row in df.iterrows():
+        values.append([cell_to_sheet_value(v) for v in row.tolist()])
+
     svc.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
         range=f"{sheet_name}!A1",
-        valueInputOption="RAW",
+        valueInputOption="USER_ENTERED",
         body={"values": values},
     ).execute()
 
 
 # =========================
-# MAPAS DAS DIMENSÕES (Sheets)
+# MAPAS DAS DIMENSÕES
 # =========================
 def load_dim_maps(svc, spreadsheet_id: str):
     df_bairro = read_sheet_as_df(svc, spreadsheet_id, "Dim_Bairro")
@@ -469,14 +445,11 @@ def load_dim_maps(svc, spreadsheet_id: str):
         for _, r in df_tipo.iterrows():
             tipo_name_to_id[norm(r.get("Nome", ""))] = str(r.get("IdTipo", "")).strip()
 
-    # Mapas de corretor
-    imoview_to_idcorretor: Dict[str, str] = {}     # IdImoview -> IdCorretor (C61xxx)
-    nome_to_idcorretor: Dict[str, str] = {}        # Nome -> IdCorretor (fallback se captador não tiver id)
-    corretor_to_gerente: Dict[str, str] = {}       # IdCorretor -> IdGerente ou Gerente
+    nome_to_idcorretor: Dict[str, str] = {}
+    corretor_to_gerente: Dict[str, str] = {}
 
     if not df_corr.empty:
         col_idcor = None
-        col_idimv = None
         col_nome = None
         col_ger = None
 
@@ -484,23 +457,20 @@ def load_dim_maps(svc, spreadsheet_id: str):
             nc = norm(c)
             if nc in {"IDCORRETOR", "ID_CORRETOR"}:
                 col_idcor = c
-            elif nc in {"IDIMOVIEW", "ID_IMOVIEW"}:
-                col_idimv = c
             elif nc in {"NOME", "NOMECORRETOR", "CORRETOR"}:
                 col_nome = c
             elif nc in {"IDGERENTE", "ID_GERENTE", "GERENTE"}:
                 col_ger = c
 
-        # fallbacks comuns
         if col_idcor is None and "IdCorretor" in df_corr.columns:
             col_idcor = "IdCorretor"
-        if col_idimv is None and "IdImoview" in df_corr.columns:
-            col_idimv = "IdImoview"
+
         if col_nome is None:
             if "Nome" in df_corr.columns:
                 col_nome = "Nome"
             elif "Corretor" in df_corr.columns:
                 col_nome = "Corretor"
+
         if col_ger is None:
             if "IdGerente" in df_corr.columns:
                 col_ger = "IdGerente"
@@ -509,12 +479,8 @@ def load_dim_maps(svc, spreadsheet_id: str):
 
         for _, r in df_corr.iterrows():
             idcor = str(r.get(col_idcor, "")).strip() if col_idcor else ""
-            idimv = str(r.get(col_idimv, "")).strip() if col_idimv else ""
             nome = str(r.get(col_nome, "")).strip() if col_nome else ""
             ger = str(r.get(col_ger, "")).strip() if col_ger else ""
-
-            if idcor and idimv and idimv.lower() != "nan":
-                imoview_to_idcorretor[idimv] = idcor
 
             if idcor and nome and nome.lower() != "nan":
                 nome_to_idcorretor[norm(nome)] = idcor
@@ -529,7 +495,6 @@ def load_dim_maps(svc, spreadsheet_id: str):
         "df_fato": df_fato,
         "bairro_name_to_id": bairro_name_to_id,
         "tipo_name_to_id": tipo_name_to_id,
-        "imoview_to_idcorretor": imoview_to_idcorretor,
         "nome_to_idcorretor": nome_to_idcorretor,
         "corretor_to_gerente": corretor_to_gerente,
     }
@@ -537,12 +502,14 @@ def load_dim_maps(svc, spreadsheet_id: str):
 
 def next_dim_id(existing_ids: List[str], prefix: str) -> str:
     nums = []
+
     for x in existing_ids:
         if isinstance(x, str) and x.startswith(prefix):
             try:
                 nums.append(int(x[len(prefix):]))
             except Exception:
                 pass
+
     n = max(nums) + 1 if nums else 1
     return f"{prefix}{n}"
 
@@ -561,6 +528,7 @@ def ensure_bairro(dim: dict, bairro_nome: str) -> Tuple[str, bool]:
 
     if "IdBairro" not in df_bairro.columns:
         df_bairro["IdBairro"] = ""
+
     if "Nome" not in df_bairro.columns:
         df_bairro["Nome"] = ""
 
@@ -570,6 +538,7 @@ def ensure_bairro(dim: dict, bairro_nome: str) -> Tuple[str, bool]:
     new_row = pd.DataFrame([{"IdBairro": new_id, "Nome": bairro_nome}])
     dim["df_bairro"] = pd.concat([df_bairro, new_row], ignore_index=True)
     dim["bairro_name_to_id"][key] = new_id
+
     return new_id, True
 
 
@@ -581,16 +550,24 @@ def map_tipo(dim: dict, tipo_nome: str) -> str:
 
 
 def is_residencial_from_tipo_id(tipo_id: str) -> bool:
-    # ajuste conforme seu Dim_Tipo (aqui é heurística)
     non_res = {"T7", "T8", "T9", "T10", "T11"}
     return str(tipo_id).strip().upper() not in non_res if tipo_id else True
 
 
 # =========================
-# UPSERT / APPEND NAS ABAS
+# UPSERT / APPEND
 # =========================
-def upsert_dim_imovel(dim: dict, codigo: int, tipo_id: str, valor: float, bairro_id: str, foco_pp: bool, foco_ac: bool):
+def upsert_dim_imovel(
+    dim: dict,
+    codigo: int,
+    tipo_id: str,
+    valor: float,
+    bairro_id: str,
+    foco_pp: bool,
+    foco_ac: bool
+):
     df = dim["df_imovel"]
+
     if df.empty:
         df = pd.DataFrame(columns=["Código", "Tipo", "Valor", "Bairro", "Foco PP", "Foco AC"])
 
@@ -604,19 +581,25 @@ def upsert_dim_imovel(dim: dict, codigo: int, tipo_id: str, valor: float, bairro
     if mask.any():
         idx = df.index[mask][0]
         df.at[idx, "Tipo"] = tipo_id
-        df.at[idx, "Valor"] = valor
+        df.at[idx, "Valor"] = float(valor)
         df.at[idx, "Bairro"] = bairro_id
-        df.at[idx, "Foco PP"] = "TRUE" if foco_pp else "FALSE"
-        df.at[idx, "Foco AC"] = "TRUE" if foco_ac else "FALSE"
+        df.at[idx, "Foco PP"] = bool(foco_pp)
+        df.at[idx, "Foco AC"] = bool(foco_ac)
     else:
-        df = pd.concat([df, pd.DataFrame([{
-            "Código": codigo,
-            "Tipo": tipo_id,
-            "Valor": valor,
-            "Bairro": bairro_id,
-            "Foco PP": "TRUE" if foco_pp else "FALSE",
-            "Foco AC": "TRUE" if foco_ac else "FALSE",
-        }])], ignore_index=True)
+        df = pd.concat(
+            [
+                df,
+                pd.DataFrame([{
+                    "Código": int(codigo),
+                    "Tipo": tipo_id,
+                    "Valor": float(valor),
+                    "Bairro": bairro_id,
+                    "Foco PP": bool(foco_pp),
+                    "Foco AC": bool(foco_ac),
+                }])
+            ],
+            ignore_index=True
+        )
 
     df = df.drop(columns=["Código_num"], errors="ignore")
     dim["df_imovel"] = df
@@ -624,6 +607,7 @@ def upsert_dim_imovel(dim: dict, codigo: int, tipo_id: str, valor: float, bairro
 
 def append_fato_captacao(dim: dict, codigo: int, captadores: List[str], gerente: str, data_entrada: date):
     df = dim["df_fato"]
+
     if df.empty:
         df = pd.DataFrame(columns=["Código", "Captador1", "Captador2", "Captador3", "Gerente", "DataEntrada"])
 
@@ -635,7 +619,6 @@ def append_fato_captacao(dim: dict, codigo: int, captadores: List[str], gerente:
     capt2 = captadores[1] if len(captadores) > 1 else ""
     capt3 = captadores[2] if len(captadores) > 2 else ""
 
-    # evita duplicar por (Código, DataEntrada, Captador1)
     df_tmp = df.copy()
     df_tmp["Código_num"] = pd.to_numeric(df_tmp["Código"], errors="coerce")
     df_tmp["DataEntrada_date"] = df_tmp["DataEntrada"].apply(parse_date_any)
@@ -647,34 +630,22 @@ def append_fato_captacao(dim: dict, codigo: int, captadores: List[str], gerente:
         dim["df_fato"] = df
         return
 
-    df = pd.concat([df, pd.DataFrame([{
-        "Código": codigo,
-        "Captador1": capt1,
-        "Captador2": capt2,
-        "Captador3": capt3,
-        "Gerente": gerente,
-        "DataEntrada": data_entrada.strftime("%d/%m/%Y"),
-    }])], ignore_index=True)
+    df = pd.concat(
+        [
+            df,
+            pd.DataFrame([{
+                "Código": int(codigo),
+                "Captador1": capt1,
+                "Captador2": capt2,
+                "Captador3": capt3,
+                "Gerente": gerente,
+                "DataEntrada": data_entrada,   # agora fica como data, não string
+            }])
+        ],
+        ignore_index=True
+    )
 
     dim["df_fato"] = df
-
-
-# =========================
-# INPUT CÓDIGOS
-# =========================
-def load_codes_from_xlsx(xlsx_path: str, sheet_name: str) -> List[int]:
-    df = pd.read_excel(xlsx_path, sheet_name=sheet_name)
-    col = None
-    for c in df.columns:
-        if norm(c) in {"CODIGO", "CÓDIGO"}:
-            col = c
-            break
-    if col is None:
-        raise RuntimeError("No XLSX, a aba indicada precisa ter uma coluna 'Código'.")
-
-    df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
-    df = df.dropna(subset=[col])
-    return sorted(df[col].astype(int).unique().tolist())
 
 
 # =========================
@@ -690,60 +661,60 @@ def main():
     svc = sheets_service(CREDENTIALS_JSON)
     dim = load_dim_maps(svc, SPREADSHEET_ID)
 
-    # 1) Carregar códigos
+    # 1) Ler CSV
+    df_csv = load_csv_as_df(CSV_PATH)
+    df_csv = filter_df_by_config(df_csv)
+
+    if df_csv.empty:
+        print("CSV vazio após os filtros. Encerrando.")
+        return
+
+    # 2) Se houver lista de códigos/XLSX, filtra o CSV por eles
     codes: List[int] = []
+
     if CODES_XLSX_PATH:
         if not os.path.exists(CODES_XLSX_PATH):
             raise RuntimeError(f"XLSX não encontrado: {CODES_XLSX_PATH}")
         codes = load_codes_from_xlsx(CODES_XLSX_PATH, CODES_XLSX_SHEET)
     elif CODES_LIST:
         codes = sorted(set([int(x) for x in CODES_LIST]))
-    else:
-        # modo data
-        if "DATE_FROM" in globals() and "DATE_TO" in globals():
-            pass
-        else:
-            raise RuntimeError("Escolha um modo na CONFIG: CODES_LIST ou CODES_XLSX_PATH ou (DATE_FROM e DATE_TO).")
-
-    # 2) Buscar no Imoview
-    imoveis: Dict[int, dict] = {}
 
     if codes:
-        imoveis = fetch_imoveis_by_codes(codes, FINALIDADE)
-    else:
-        # modo data
-        if "DATE_FROM" not in globals() or "DATE_TO" not in globals():
-            raise RuntimeError("Para modo data, defina DATE_FROM e DATE_TO na CONFIG.")
-        imoveis = fetch_imoveis_by_date(globals()["DATE_FROM"], globals()["DATE_TO"], FINALIDADE)
+        df_csv["Codigo_num"] = pd.to_numeric(df_csv["Codigo"], errors="coerce")
+        df_csv_filtrado = df_csv[df_csv["Codigo_num"].isin(codes)].copy()
 
-    if not imoveis:
-        print("Nada retornou do Imoview. Encerrando.")
-        if codes:
-            pd.DataFrame({"codigo_faltante": codes}).to_csv("codigos_nao_retornaram.csv", index=False, encoding="utf-8-sig")
-            print(f"Arquivo gerado: codigos_nao_retornaram.csv (todos faltantes)")
-        return
-
-    # 3) Relatório de faltantes (quando você passou lista de códigos)
-    if codes:
+        returned_set = set(df_csv_filtrado["Codigo_num"].dropna().astype(int).tolist())
         codes_set = set(codes)
-        returned_set = set(imoveis.keys())
         missing = sorted(codes_set - returned_set)
         returned_sorted = sorted(returned_set)
 
-        print(f"Total planilha/lista: {len(codes)} | Retornados: {len(returned_set)} | Faltantes: {len(missing)}")
-        if missing:
-            print("Códigos que NÃO retornaram do endpoint (provavelmente não estão vago/disponível):")
-            print(missing)
+        print(f"Total lista/planilha: {len(codes)} | Encontrados no CSV: {len(returned_set)} | Faltantes: {len(missing)}")
 
-        pd.DataFrame({"codigo_retornado": returned_sorted}).to_csv("codigos_retornados.csv", index=False, encoding="utf-8-sig")
-        pd.DataFrame({"codigo_faltante": missing}).to_csv("codigos_nao_retornaram.csv", index=False, encoding="utf-8-sig")
-        print("Arquivos gerados: codigos_retornados.csv | codigos_nao_retornaram.csv")
+        pd.DataFrame({"codigo_encontrado_csv": returned_sorted}).to_csv(
+            "codigos_encontrados_csv.csv",
+            index=False,
+            encoding="utf-8-sig"
+        )
+        pd.DataFrame({"codigo_faltante_csv": missing}).to_csv(
+            "codigos_faltantes_csv.csv",
+            index=False,
+            encoding="utf-8-sig"
+        )
+
+        df_csv = df_csv_filtrado.drop(columns=["Codigo_num"], errors="ignore")
+
+    # 3) Montar estrutura semelhante ao retorno anterior
+    imoveis = build_imoveis_from_csv(df_csv)
+
+    if not imoveis:
+        print("Nenhum imóvel válido encontrado no CSV.")
+        return
 
     # 4) Processar e atualizar Sheets
     novos_bairros_criados = False
 
     for codigo, item in imoveis.items():
-        data = extract_fields(item)
+        data = extract_fields_from_csv_row(pd.Series(item))
 
         codigo = int(data["codigo"])
         bairro_nome = data["bairro_nome"]
@@ -751,29 +722,14 @@ def main():
         tipo_nome = data["tipo_nome"]
         comissao = float(data["comissao_pct"])
 
-        captadores_imoview_ids = data["captador_ids"]       # pode vir vazio dependendo do JSON
-        captadores_imoview_nomes = data["captador_nomes"]   # fallback por nome
+        captadores_csv_nomes = data["captador_nomes"]
 
-        # resolver captadores:
-        # 1) se tiver id -> IdImoview -> IdCorretor
-        # 2) se não tiver id -> tenta Nome -> IdCorretor
-        # 3) se não der -> grava o que tiver (id ou nome) como fallback final
         captadores: List[str] = []
-
-        if captadores_imoview_ids:
-            for cid in captadores_imoview_ids:
-                key = str(cid).strip()
-                mapped = dim["imoview_to_idcorretor"].get(key, "")
-                captadores.append(mapped if mapped else key)
-        elif captadores_imoview_nomes:
-            for nome in captadores_imoview_nomes:
-                mapped = dim["nome_to_idcorretor"].get(norm(nome), "")
-                captadores.append(mapped if mapped else nome)
-        else:
-            captadores = []
+        for nome in captadores_csv_nomes:
+            mapped = dim["nome_to_idcorretor"].get(norm(nome), "")
+            captadores.append(mapped if mapped else nome)
 
         captadores = [str(x).strip() for x in captadores if str(x).strip()][:3]
-
         data_entrada = data["data_entrada"] or date.today()
 
         bairro_id, created = ensure_bairro(dim, bairro_nome)
@@ -785,7 +741,6 @@ def main():
 
         foco_pp, foco_ac = classificar_foco(bairro_nome, valor, comissao, residencial)
 
-        # gerente: tenta por capt1 (se for IdCorretor tipo C61xxx)
         capt1 = captadores[0] if captadores else ""
         gerente = dim["corretor_to_gerente"].get(str(capt1), "")
 
@@ -794,8 +749,8 @@ def main():
 
         print(
             f"[OK] {codigo} | {bairro_nome} | valor={valor:.0f} | com={comissao} | "
-            f"capt(imoview_ids)={captadores_imoview_ids} capt(imoview_nomes)={captadores_imoview_nomes} -> "
-            f"capt(final)={captadores} | ger={gerente} | PP={foco_pp} AC={foco_ac}"
+            f"capt(csv_nomes)={captadores_csv_nomes} -> capt(final)={captadores} | "
+            f"ger={gerente} | PP={foco_pp} AC={foco_ac}"
         )
 
     # 5) Persistir no Google Sheets
