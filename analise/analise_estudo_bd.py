@@ -32,8 +32,13 @@ CONFIG = {
     "TABELA": "imoveis",
 
     # filtros do estudo (default)
+<<<<<<< HEAD
     "BAIRRO_ALVO": "ASA SUL",
     "TIPO_ALVO": "CASA",
+=======
+    "BAIRRO_ALVO": "LAGO SUL",
+    "TIPO_ALVO": "APARTAMENTO",
+>>>>>>> feat: adicionando ranking gerente
     "OFERTA_ALVO": "VENDA",  # aceitos: VENDA, PUBLICADO, etc.
 
     "PRECO_MIN": 1_000_000,

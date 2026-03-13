@@ -36,7 +36,10 @@ except Exception:
 # ============================================================
 
 CONFIG = {
+<<<<<<< HEAD
     "BAIRRO_ALVO": "LAGO SUL",
+=======
+>>>>>>> feat: adicionando ranking gerente
     "TIPO_ALVO": "APARTAMENTO",
     "OFERTA_ALVO": "VENDA",
 

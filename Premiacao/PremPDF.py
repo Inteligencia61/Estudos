@@ -374,7 +374,7 @@ def main(file_path=None):
 
     # 2) Filtro de Data
     df['Data_Contrato'] = pd.to_datetime(df['Data_Contrato'], errors='coerce')
-    df_mes = df[(df['Data_Contrato'] >= '2026-01-01') & (df['Data_Contrato'] <= '2026-01-31')].copy()
+    df_mes = df[(df['Data_Contrato'] >= '2026-02-01') & (df['Data_Contrato'] <= '2026-02-28')].copy()
 
     # 3) Separação de Equipes (AC vs PP)
     def is_especial(row):

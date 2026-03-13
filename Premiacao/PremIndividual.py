@@ -389,7 +389,7 @@ def main(file_path=None):
 
     df_mes=df[
         (df['Data_Contrato']>='2026-01-01') &
-        (df['Data_Contrato']<='2026-03-06')
+        (df['Data_Contrato']<='2026-03-11')
     ].copy()
 
     res_geral=processar_rankings(df_mes,'CORRETOR')
