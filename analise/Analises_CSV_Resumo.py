@@ -29,7 +29,7 @@ from psycopg2.extras import RealDictCursor
 CONFIG = {
     "TABELA": "imoveis",  # ajuste se necessário
 
-    "BAIRRO_ALVO": "ASA SUL",
+    "BAIRRO_ALVO": "LAGO SUL",
     "TIPO_ALVO": "APARTAMENTO",
     "OFERTA_ALVO": "VENDA",
 

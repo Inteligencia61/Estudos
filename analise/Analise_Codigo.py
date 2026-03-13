@@ -36,7 +36,7 @@ except Exception:
 # ============================================================
 
 CONFIG = {
-    "BAIRRO_ALVO": "ASA SUL",
+    "BAIRRO_ALVO": "LAGO SUL",
     "TIPO_ALVO": "APARTAMENTO",
     "OFERTA_ALVO": "VENDA",
 

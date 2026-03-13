@@ -32,14 +32,14 @@ CONFIG = {
     "TABELA": "imoveis",
 
     # filtros do estudo (default)
-    "BAIRRO_ALVO": "ASA NORTE",
-    "TIPO_ALVO": "APARTAMENTO",
+    "BAIRRO_ALVO": "ASA SUL",
+    "TIPO_ALVO": "CASA",
     "OFERTA_ALVO": "VENDA",  # aceitos: VENDA, PUBLICADO, etc.
 
     "PRECO_MIN": 1_000_000,
-    "PRECO_MAX": 30_000_000,
+    "PRECO_MAX": 50_000_000,
     "AREA_MIN": 40,
-    "AREA_MAX": 50_000,
+    "AREA_MAX": 1500_000,
 
     "VLM2_MIN": 6_000,
     "VLM2_MAX": 900_000,
@@ -69,8 +69,8 @@ CONFIG = {
     # regras de segmentos
     "MIN_AMOSTRA_SEGMENTO": 3,  # evita gravar segmentos com amostra muito baixa
     # faixas de metragem (ajuste se quiser)
-    "METRAGEM_BINS": [0, 75, 90, 130, 160, 200, 10_000_000],
-    "METRAGEM_LABELS": ["<75", "75-90", "90-130", "130-160", "160-200", ">200"],
+    "METRAGEM_BINS": [0, 75, 90, 130, 160, 200, 400, 600, 800, 1000, 10_000_000],
+    "METRAGEM_LABELS": ["<75", "75-90", "90-130", "130-160", "160-200", "200-400", "400-600","600-800", "800-1000", ">1000"],
 }
 
 
@@ -341,8 +341,8 @@ def _agg_metricas(df: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
             amostra=("valor_m2", "size"),
             m2_medio=("valor_m2", "mean"),
             m2_mediana=("valor_m2", "median"),
-            preco_mediana=("preco", "median"),
-            area_mediana=("area_util", "median"),
+            preco_mediana=("preco", "mean"),
+            area_mediana=("area_util", "mean"),
         )
         .reset_index()
     )
