@@ -41,12 +41,12 @@ CONFIG = {
 =======
 >>>>>>> feat: adicionando ranking gerente
     "TIPO_ALVO": "APARTAMENTO",
-    "OFERTA_ALVO": "VENDA",
+    "OFERTA_ALVO": "Publicado",
 
     "PRECO_MIN": 1_000_000,
     "PRECO_MAX": 30_000_000,
     "AREA_MIN": 40,
-    "AREA_MAX": 50_000,
+    "AREA_MAX": 500_000,
 
     "VLM2_MIN": 6_000,
     "VLM2_MAX": 900_000,
@@ -447,6 +447,26 @@ def clusters_3_grupos(dados: pd.DataFrame) -> Optional[pd.DataFrame]:
     return out.sort_values("m2_medio")
 
 
+def clusterizar_luxo(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    coluna_cluster['preco','area_util']
+    df_clean = dados.dropna(subset=coluna_cluster).copy
+    scaler = StandardScaler()
+    X_scale = scaler.fit_transform(df_clean[coluna_cluster])
+    km = KMeans(n_clusters=5, random_state=42, n_init=10)
+    df_clean["cluster_id"] = km.fit_predict(X_scale)
+    cluster_order = (
+        df_clean.groupby("cluster_id")["preco"]
+        .mean()
+        .sort_value()
+        .index.tolist()
+    )
+    label = ["Luxo", "Alto Luxo"]
+    mapping = {cluster_id: labels[min(i//3,2)] for i, cluster in enumarate(cluster_order)}
+    df_clean["cluster_nome"] = df_clean["cluster_id"].map(mapping)
+    print(df_clean)
+
+
+
 # ============================================================
 # Orquestração
 # ============================================================
@@ -467,7 +487,8 @@ def carregar_varios_csvs(paths: List[str]) -> pd.DataFrame:
 
 
 def analisar_e_printar(dados: pd.DataFrame) -> None:
-    # Visão geral
+    # Visão 
+    print(f"Tamanho df: {len(dados)}")
     geral = [resumo_estatistico(dados, f"{CONFIG['BAIRRO_ALVO']} - GERAL")]
     imprimir_tabela("RESUMO GERAL (após limpeza)", geral)
 
@@ -482,16 +503,22 @@ def analisar_e_printar(dados: pd.DataFrame) -> None:
         imprimir_tabela("RESUMO POR QUARTOS", rows)
 
     # Por vaga
+    dados = dados.fillna({"vagas":0})
+    
     if CONFIG["ANALISAR_POR_VAGA"] and "vagas" in dados.columns:
         rows = []
         seg_sem = dados[dados["vagas"] <= 0]
+        print(f"Seg s.Vagas: {len(seg_sem)}")
         seg_com = dados[dados["vagas"] > 0]
+        print(f"Seg c.Vagas: {len(seg_com)}")
         rows.append(resumo_estatistico(seg_sem, "Sem vaga"))
         rows.append(resumo_estatistico(seg_com, "Com vaga"))
         imprimir_tabela("RESUMO POR VAGA", rows)
 
     # Tendência por data (tabela)
+    print("Passou aqui")
     if "data_dt" in dados.columns and dados["data_dt"].notna().any():
+        print("Vai flamengo")
         trend = (
             dados.dropna(subset=["data_dt"])
             .groupby(dados["data_dt"].dt.date)
@@ -530,6 +557,7 @@ def analisar_e_printar(dados: pd.DataFrame) -> None:
 
     # Clusters (tabela + gráficos)
     cl = clusters_3_grupos(dados)
+    clusterizar_luxo(dados)
     if cl is not None and not cl.empty:
         cl = cl.copy()
         for c in ["m2_medio", "m2_mediana", "preco_medio"]:
@@ -549,22 +577,24 @@ def analisar_e_printar(dados: pd.DataFrame) -> None:
     if len(dados) > 0:
         print(f"m² mediana: {dados['valor_m2'].median():,.0f}".replace(",", "."))
         print(f"m² média:    {dados['valor_m2'].mean():,.0f}".replace(",", "."))
-        print(f"Preço mediana: {dados['preco'].median():,.0f}".replace(",", "."))
-        print(f"Área mediana:  {dados['area_util'].median():,.1f}".replace(",", "."))
+        print(f"Preço medio: {dados['preco'].mean():,.0f}".replace(",", "."))
+        print(f"Área medio:  {dados['area_util'].mean():,.1f}".replace(",", "."))
 
 
 def main():
     parser = argparse.ArgumentParser(description="Análise limpa e precisa - ASA SUL (vários CSVs).")
     parser.add_argument("csvs", nargs="+", help="Lista de arquivos CSV (um ou mais). Ex: 2026-01-04.csv")
     args = parser.parse_args()
+    df = pd.read_csv("./2026-03-08.csv")
+    df["data_dt"] = '2026-03-08'
 
-    dados = carregar_varios_csvs(args.csvs)
+    
 
-    if dados.empty:
+    if df.empty:
         print("Nenhum dado válido após a limpeza. Verifique bairro/tipo/oferta e faixas.")
         return
 
-    analisar_e_printar(dados)
+    analisar_e_printar(df)
 
 
 if __name__ == "__main__":
