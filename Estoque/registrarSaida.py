@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 CREDENTIALS_JSON = r"../cred.json"
 SPREADSHEET_ID = "1HQDdcbUMj276hnIbPs-WwdWHiUPzMhPRWt4HHRyYGnw"
 
-INPUT_CSV_PATH = "../data/saidas-imo.csv"
+INPUT_CSV_PATH = "./saidas-13:03.csv"
 CSV_SEP = ";"
 CSV_ENCODING = "utf-8-sig"
 

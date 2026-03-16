@@ -5,7 +5,7 @@ from datetime import datetime
 # =========================
 # CONFIG
 # =========================
-INPUT_XLS = "./imoveis-2026-03-06-131817.xls" # seu export do Imoview (HTML disfarçado de .xls)
+INPUT_XLS = "./imoveis-2026-03-16-121342.xls" # seu export do Imoview (HTML disfarçado de .xls)
 OUTPUT_XLSX = "./Fato_Estoque_IMPORTAR.xlsx"   # ESTE é o arquivo que você vai importar no App Script
 
 # Data do estoque como data real (célula de Excel)

@@ -25,7 +25,7 @@ CREDENTIALS_JSON = r"../cred.json"
 SPREADSHEET_ID = "1HQDdcbUMj276hnIbPs-WwdWHiUPzMhPRWt4HHRyYGnw"
 
 # --- CSV de entrada ---
-CSV_PATH = r"../data/captacoes-imoveis.csv"
+CSV_PATH = r"./caps-13:03.csv"
 CSV_SEP = ";"
 CSV_ENCODING = "utf-8-sig"
 

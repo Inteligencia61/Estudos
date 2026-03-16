@@ -1,7 +1,7 @@
 # analise.py
 # ============================================================
 # Lê VÁRIOS CSVs e faz análise com limpeza + análise mensal
-# para ASA SUL (APARTAMENTO / VENDA).
+# com clusterização adicional por Luxo e Alto Luxo.
 #
 # Uso:
 #   python ./analise/analise.py 2026-01-04.csv 2026-01-11.csv ...
@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import os
 import re
-from datetime import date
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -37,7 +36,7 @@ except Exception:
 
 CONFIG = {
     "BAIRRO_ALVO": "LAGO SUL",
-    "TIPO_ALVO": "APARTAMENTO",
+    "TIPO_ALVO": "CASA",
     "OFERTA_ALVO": "Publicado",
 
     "PRECO_MIN": 1_000_000,
@@ -55,6 +54,9 @@ CONFIG = {
 
     "CLUSTERS_ATIVOS": True,
     "MIN_AMOSTRA_PARA_CLUSTER": 20,
+
+    # Nova segmentação
+    "MIN_AMOSTRA_PARA_CLUSTER_LUXO": 12,
 }
 
 
@@ -101,7 +103,6 @@ def extrair_data_do_nome_arquivo(path: str) -> Optional[str]:
 def padronizar_colunas(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # normaliza nomes de colunas
     col_map = {c: re.sub(r"\s+", "_", str(c).strip().lower()) for c in df.columns}
     df.rename(columns=col_map, inplace=True)
 
@@ -176,18 +177,17 @@ def limpar_dados(df: pd.DataFrame, data_ref: Optional[str]) -> pd.DataFrame:
 
     # data: coluna > nome do arquivo
     if "data" in df.columns:
-        # tenta converter (se falhar vira NaT)
         dt = pd.to_datetime(df["data"], errors="coerce")
         df["data"] = dt.dt.date.astype("string")
     else:
         df["data"] = data_ref if data_ref else pd.NA
 
     # remove duplicados
-    if "codigo" in df.columns:
-        df["codigo"] = normalizar_texto(df["codigo"])
-        df = df.drop_duplicates(subset=["codigo"])
-    else:
-        df = df.drop_duplicates(subset=["preco", "area_util", "quartos", "bairro", "tipo"])
+    #if "codigo" in df.columns:
+    #    df["codigo"] = normalizar_texto(df["codigo"])
+    #    df = df.drop_duplicates(subset=["codigo"])
+    #else:
+    #   df = df.drop_duplicates(subset=["preco", "area_util", "quartos", "bairro", "tipo"])
 
     # filtros alvo
     if "bairro" in df.columns:
@@ -202,23 +202,20 @@ def limpar_dados(df: pd.DataFrame, data_ref: Optional[str]) -> pd.DataFrame:
     df = df[(df["preco"] >= CONFIG["PRECO_MIN"]) & (df["preco"] <= CONFIG["PRECO_MAX"])]
     df = df[(df["area_util"] >= CONFIG["AREA_MIN"]) & (df["area_util"] <= CONFIG["AREA_MAX"])]
 
-    # calcula vlm2 sempre (não confia em valor_m2 do CSV)
+    # calcula valor_m2 sempre
     df["valor_m2"] = df["preco"] / df["area_util"]
 
     # faixa de mercado
     df = df[(df["valor_m2"] >= CONFIG["VLM2_MIN"]) & (df["valor_m2"] <= CONFIG["VLM2_MAX"])]
 
-    # IQR (depois do filtro de mercado)
+    # IQR
     if CONFIG["APLICAR_IQR"] and len(df) >= 20:
         df = remover_outliers_iqr(df, "valor_m2")
 
     df["quartos"] = df["quartos"].fillna(0).astype(int)
     df["vagas"] = df["vagas"].fillna(0).astype(int)
 
-    # cria "data_dt" para análises (se não der, fica NaT)
     df["data_dt"] = pd.to_datetime(df["data"], errors="coerce")
-
-    # cria "mes" (YYYY-MM)
     df["mes"] = df["data_dt"].dt.to_period("M").astype("string")
 
     return df
@@ -275,14 +272,9 @@ def imprimir_tabela(titulo: str, rows: List[Dict[str, object]]) -> None:
 # ============================================================
 
 def plot_mensal_base(dados: pd.DataFrame) -> None:
-    """
-    Cria 2 gráficos mensais:
-    - Linha da mediana do m² por mês + amostra
-    - Boxplot da distribuição do m² por mês (noção de dispersão/caudas)
-    """
     base = dados.dropna(subset=["data_dt"]).copy()
     if base.empty or base["mes"].isna().all():
-        print("[INFO] Sem datas válidas para gráficos mensais (coluna data ou data no nome do arquivo).")
+        print("[INFO] Sem datas válidas para gráficos mensais.")
         return
 
     agg_mes = (
@@ -296,7 +288,6 @@ def plot_mensal_base(dados: pd.DataFrame) -> None:
         .sort_values("mes")
     )
 
-    # 1) Linha: mediana do m² + amostra
     plt.figure(figsize=(12, 6))
     plt.plot(agg_mes["mes"], agg_mes["m2_mediana"], marker="o")
     plt.xticks(rotation=45, ha="right")
@@ -310,14 +301,13 @@ def plot_mensal_base(dados: pd.DataFrame) -> None:
     plt.close()
     print("[INFO] Gráfico salvo: trend_mensal_m2.png")
 
-    # 2) Boxplot: distribuição do m² por mês
     meses_ordenados = agg_mes["mes"].tolist()
     series = [base.loc[base["mes"] == m, "valor_m2"].values for m in meses_ordenados]
 
     plt.figure(figsize=(12, 6))
     plt.boxplot(series, labels=meses_ordenados, showfliers=False)
     plt.xticks(rotation=45, ha="right")
-    plt.title(f"Distribuição do Valor/m² por mês (sem outliers extremos) - {CONFIG['BAIRRO_ALVO']}")
+    plt.title(f"Distribuição do Valor/m² por mês - {CONFIG['BAIRRO_ALVO']}")
     plt.xlabel("Mês (YYYY-MM)")
     plt.ylabel("R$/m²")
     plt.tight_layout()
@@ -327,7 +317,6 @@ def plot_mensal_base(dados: pd.DataFrame) -> None:
 
 
 def plot_diario_se_existir(dados: pd.DataFrame) -> None:
-    """Gráfico diário simples (mediana do m² por dia), se houver datas."""
     base = dados.dropna(subset=["data_dt"]).copy()
     if base.empty:
         return
@@ -355,7 +344,7 @@ def plot_diario_se_existir(dados: pd.DataFrame) -> None:
 
 
 # ============================================================
-# Clusters + gráficos (inclui cluster por mês)
+# Clusters padrão
 # ============================================================
 
 def clusters_3_grupos(dados: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -371,7 +360,6 @@ def clusters_3_grupos(dados: pd.DataFrame) -> Optional[pd.DataFrame]:
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(df_clean[colunas_cluster])
 
-    # Mantive sua ideia: 9 clusters -> agrupados em 3 faixas
     km = KMeans(n_clusters=9, random_state=42, n_init=10)
     df_clean["cluster_id"] = km.fit_predict(X_scaled)
 
@@ -386,21 +374,19 @@ def clusters_3_grupos(dados: pd.DataFrame) -> Optional[pd.DataFrame]:
     mapping = {cluster_id: labels[min(i // 3, 2)] for i, cluster_id in enumerate(cluster_order)}
     df_clean["cluster_nome"] = df_clean["cluster_id"].map(mapping)
 
-    # 1) Scatter Área x R$/m² por cluster (matplotlib puro)
     plt.figure(figsize=(12, 7))
     for nome, seg in df_clean.groupby("cluster_nome"):
         plt.scatter(seg["area_util"], seg["valor_m2"], alpha=0.55, s=30, label=nome)
     plt.title(f"Distribuição de Clusters - {CONFIG['BAIRRO_ALVO']} (Área x R$/m²)")
     plt.xlabel("Área Útil (m²)")
     plt.ylabel("Valor por m² (R$)")
-    plt.legend(title="Cluster (proxy)")
+    plt.legend(title="Cluster")
     plt.tight_layout()
     nome_plot = f"clusters_{CONFIG['BAIRRO_ALVO'].lower().replace(' ', '_')}.png"
     plt.savefig(nome_plot, bbox_inches="tight")
     plt.close()
     print(f"[INFO] Gráfico salvo: {nome_plot}")
 
-    # 2) Barras: contagem por mês em cada cluster (se tiver mês)
     if "mes" in df_clean.columns and df_clean["mes"].notna().any():
         tab = (
             df_clean.groupby(["mes", "cluster_nome"])
@@ -423,13 +409,12 @@ def clusters_3_grupos(dados: pd.DataFrame) -> Optional[pd.DataFrame]:
         plt.title(f"Distribuição de Clusters por mês - {CONFIG['BAIRRO_ALVO']}")
         plt.xlabel("Mês (YYYY-MM)")
         plt.ylabel("Quantidade")
-        plt.legend(title="Cluster (proxy)")
+        plt.legend(title="Cluster")
         plt.tight_layout()
         plt.savefig("clusters_por_mes.png", bbox_inches="tight")
         plt.close()
         print("[INFO] Gráfico salvo: clusters_por_mes.png")
 
-    # tabela resumida
     out = (
         df_clean.groupby("cluster_nome")
         .agg(
@@ -444,24 +429,114 @@ def clusters_3_grupos(dados: pd.DataFrame) -> Optional[pd.DataFrame]:
     return out.sort_values("m2_medio")
 
 
-def clusterizar_luxo(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    coluna_cluster['preco','area_util']
-    df_clean = dados.dropna(subset=coluna_cluster).copy
+# ============================================================
+# Nova clusterização: Luxo e Alto Luxo
+# ============================================================
+
+def clusterizar_luxo_alto_luxo(dados: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    Clusterização específica em 2 grupos:
+    - Luxo
+    - Alto Luxo
+
+    Usa preço, valor_m2 e área_util para separar os imóveis.
+    O cluster com menor preço médio vira Luxo.
+    O cluster com maior preço médio vira Alto Luxo.
+    """
+    if not SKLEARN_OK or not CONFIG.get("CLUSTERS_ATIVOS", False):
+        return None
+
+    if dados.empty or len(dados) < CONFIG.get("MIN_AMOSTRA_PARA_CLUSTER_LUXO", 12):
+        print("[INFO] Amostra pequena para cluster de Luxo/Alto Luxo.")
+        return None
+
+    colunas_cluster = ["preco", "valor_m2", "area_util"]
+    df_clean = dados.dropna(subset=colunas_cluster).copy()
+
+    if len(df_clean) < CONFIG.get("MIN_AMOSTRA_PARA_CLUSTER_LUXO", 12):
+        print("[INFO] Amostra insuficiente após limpeza para cluster de Luxo/Alto Luxo.")
+        return None
+
     scaler = StandardScaler()
-    X_scale = scaler.fit_transform(df_clean[coluna_cluster])
-    km = KMeans(n_clusters=5, random_state=42, n_init=10)
-    df_clean["cluster_id"] = km.fit_predict(X_scale)
+    X_scaled = scaler.fit_transform(df_clean[colunas_cluster])
+    n_cluster=100
+    km = KMeans(n_clusters=n_cluster, random_state=42, n_init=10)
+    df_clean["cluster_id"] = km.fit_predict(X_scaled)
+    metade = n_cluster // 2 
+
     cluster_order = (
         df_clean.groupby("cluster_id")["preco"]
         .mean()
-        .sort_value()
+        .sort_values()
         .index.tolist()
     )
-    label = ["Luxo", "Alto Luxo"]
-    mapping = {cluster_id: labels[min(i//3,2)] for i, cluster in enumarate(cluster_order)}
-    df_clean["cluster_nome"] = df_clean["cluster_id"].map(mapping)
-    print(df_clean)
 
+    labels = ["Luxo", "Alto Luxo"]
+    mapping = {
+        cluster_id: "Luxo" if i < metade else "Alto Luxo"
+        for i, cluster_id in enumerate(cluster_order)
+    }
+    df_clean["cluster_nome"] = df_clean["cluster_id"].map(mapping)
+
+    # Scatter
+    plt.figure(figsize=(12, 7))
+    for nome, seg in df_clean.groupby("cluster_nome"):
+        plt.scatter(seg["area_util"], seg["valor_m2"], alpha=0.60, s=35, label=nome)
+
+    plt.title(f"Clusterização Luxo x Alto Luxo - {CONFIG['BAIRRO_ALVO']}")
+    plt.xlabel("Área Útil (m²)")
+    plt.ylabel("Valor por m² (R$)")
+    plt.legend(title="Segmento")
+    plt.tight_layout()
+    plt.savefig("clusters_luxo_alto_luxo.png", bbox_inches="tight")
+    plt.close()
+    print("[INFO] Gráfico salvo: clusters_luxo_alto_luxo.png")
+
+    # Barras por mês
+    if "mes" in df_clean.columns and df_clean["mes"].notna().any():
+        tab = (
+            df_clean.groupby(["mes", "cluster_nome"])
+            .size()
+            .unstack(fill_value=0)
+            .sort_index()
+        )
+
+        plt.figure(figsize=(12, 6))
+        bottom = None
+        for col in tab.columns:
+            if bottom is None:
+                plt.bar(tab.index.astype(str), tab[col].values, label=col)
+                bottom = tab[col].values.copy()
+            else:
+                plt.bar(tab.index.astype(str), tab[col].values, bottom=bottom, label=col)
+                bottom += tab[col].values
+
+        plt.xticks(rotation=45, ha="right")
+        plt.title(f"Luxo x Alto Luxo por mês - {CONFIG['BAIRRO_ALVO']}")
+        plt.xlabel("Mês (YYYY-MM)")
+        plt.ylabel("Quantidade")
+        plt.legend(title="Segmento")
+        plt.tight_layout()
+        plt.savefig("luxo_alto_luxo_por_mes.png", bbox_inches="tight")
+        plt.close()
+        print("[INFO] Gráfico salvo: luxo_alto_luxo_por_mes.png")
+
+    out = (
+        df_clean.groupby("cluster_nome")
+        .agg(
+            amostra=("cluster_nome", "size"),
+            preco_medio=("preco", "mean"),
+            preco_mediana=("preco", "median"),
+            m2_medio=("valor_m2", "mean"),
+            m2_mediana=("valor_m2", "median"),
+            area_media=("area_util", "mean"),
+            area_mediana=("area_util", "median"),
+        )
+        .reset_index()
+        .sort_values("preco_medio")
+    )
+
+    return out
 
 
 # ============================================================
@@ -484,15 +559,15 @@ def carregar_varios_csvs(paths: List[str]) -> pd.DataFrame:
 
 
 def analisar_e_printar(dados: pd.DataFrame) -> None:
-    # Visão 
     print(f"Tamanho df: {len(dados)}")
+
     geral = [resumo_estatistico(dados, f"{CONFIG['BAIRRO_ALVO']} - GERAL")]
     imprimir_tabela("RESUMO GERAL (após limpeza)", geral)
 
     # Por quartos
     if CONFIG["ANALISAR_POR_QUARTOS"] and "quartos" in dados.columns:
         rows = []
-        for q in sorted(dados["quartos"].unique()):
+        for q in sorted(dados["quartos"].dropna().unique()):
             if q <= 0:
                 continue
             seg = dados[dados["quartos"] == q]
@@ -500,26 +575,26 @@ def analisar_e_printar(dados: pd.DataFrame) -> None:
         imprimir_tabela("RESUMO POR QUARTOS", rows)
 
     # Por vaga
-    dados = dados.fillna({"vagas":0})
-    
+    dados = dados.fillna({"vagas": 0})
+
     if CONFIG["ANALISAR_POR_VAGA"] and "vagas" in dados.columns:
         rows = []
         seg_sem = dados[dados["vagas"] <= 0]
-        print(f"Seg s.Vagas: {len(seg_sem)}")
         seg_com = dados[dados["vagas"] > 0]
-        print(f"Seg c.Vagas: {len(seg_com)}")
         rows.append(resumo_estatistico(seg_sem, "Sem vaga"))
         rows.append(resumo_estatistico(seg_com, "Com vaga"))
         imprimir_tabela("RESUMO POR VAGA", rows)
 
-    # Tendência por data (tabela)
-    print("Passou aqui")
+    # Tendência por data
     if "data_dt" in dados.columns and dados["data_dt"].notna().any():
-        print("Vai flamengo")
         trend = (
             dados.dropna(subset=["data_dt"])
             .groupby(dados["data_dt"].dt.date)
-            .agg(amostra=("valor_m2", "size"), m2_mediana=("valor_m2", "median"), m2_medio=("valor_m2", "mean"))
+            .agg(
+                amostra=("valor_m2", "size"),
+                m2_mediana=("valor_m2", "median"),
+                m2_medio=("valor_m2", "mean"),
+            )
             .reset_index()
             .sort_values("data_dt")
         )
@@ -531,12 +606,16 @@ def analisar_e_printar(dados: pd.DataFrame) -> None:
         print("=" * 70)
         print(trend.to_string(index=False))
 
-    # Tendência por mês (tabela)
+    # Tendência por mês
     if "mes" in dados.columns and dados["mes"].notna().any():
         trend_mes = (
             dados.dropna(subset=["data_dt"])
             .groupby("mes")
-            .agg(amostra=("mes", "size"), m2_mediana=("valor_m2", "median"), m2_medio=("valor_m2", "mean"))
+            .agg(
+                amostra=("mes", "size"),
+                m2_mediana=("valor_m2", "median"),
+                m2_medio=("valor_m2", "mean"),
+            )
             .reset_index()
             .sort_values("mes")
         )
@@ -548,13 +627,12 @@ def analisar_e_printar(dados: pd.DataFrame) -> None:
         print("=" * 70)
         print(trend_mes.to_string(index=False))
 
-    # Gráficos mensais (base)
+    # Gráficos
     plot_diario_se_existir(dados)
     plot_mensal_base(dados)
 
-    # Clusters (tabela + gráficos)
+    # Cluster padrão
     cl = clusters_3_grupos(dados)
-    clusterizar_luxo(dados)
     if cl is not None and not cl.empty:
         cl = cl.copy()
         for c in ["m2_medio", "m2_mediana", "preco_medio"]:
@@ -566,6 +644,20 @@ def analisar_e_printar(dados: pd.DataFrame) -> None:
         print("=" * 70)
         print(cl.to_string(index=False))
 
+    # Novo cluster luxo / alto luxo
+    cl_luxo = clusterizar_luxo_alto_luxo(dados)
+    if cl_luxo is not None and not cl_luxo.empty:
+        cl_luxo = cl_luxo.copy()
+        for c in ["preco_medio", "preco_mediana", "m2_medio", "m2_mediana"]:
+            cl_luxo[c] = cl_luxo[c].map(lambda x: f"{x:,.0f}".replace(",", "."))
+        for c in ["area_media", "area_mediana"]:
+            cl_luxo[c] = cl_luxo[c].map(lambda x: f"{x:,.1f}".replace(",", "."))
+
+        print("\n" + "=" * 70)
+        print("CLUSTERIZAÇÃO LUXO X ALTO LUXO")
+        print("=" * 70)
+        print(cl_luxo.to_string(index=False))
+
     # Checklist
     print("\n" + "=" * 70)
     print("CHECKLIST DE QUALIDADE (sanidade)")
@@ -574,18 +666,25 @@ def analisar_e_printar(dados: pd.DataFrame) -> None:
     if len(dados) > 0:
         print(f"m² mediana: {dados['valor_m2'].median():,.0f}".replace(",", "."))
         print(f"m² média:    {dados['valor_m2'].mean():,.0f}".replace(",", "."))
-        print(f"Preço medio: {dados['preco'].mean():,.0f}".replace(",", "."))
-        print(f"Área medio:  {dados['area_util'].mean():,.1f}".replace(",", "."))
+        print(f"Preço médio: {dados['preco'].mean():,.0f}".replace(",", "."))
+        print(f"Área média:  {dados['area_util'].mean():,.1f}".replace(",", "."))
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Análise limpa e precisa - ASA SUL (vários CSVs).")
-    parser.add_argument("csvs", nargs="+", help="Lista de arquivos CSV (um ou mais). Ex: 2026-01-04.csv")
+    parser = argparse.ArgumentParser(
+        description="Análise limpa e precisa com clusterização Luxo x Alto Luxo."
+    )
+    parser.add_argument("csvs", nargs="*", help="Lista de arquivos CSV. Ex: 2026-01-04.csv")
     args = parser.parse_args()
-    df = pd.read_csv("./2026-03-08.csv")
-    df["data_dt"] = '2026-03-08'
 
-    
+    # Se quiser testar direto no código:
+    if args.csvs:
+        df = carregar_varios_csvs(args.csvs)
+    else:
+        df = pd.read_csv("./2026-03-08.csv", encoding="utf-8-sig")
+        print(len(df))
+        df = limpar_dados(df, data_ref="2026-03-08")
+        print(len(df))
 
     if df.empty:
         print("Nenhum dado válido após a limpeza. Verifique bairro/tipo/oferta e faixas.")
