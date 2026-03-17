@@ -32,10 +32,8 @@ CONFIG = {
     "TABELA": "imoveis",
 
     # filtros do estudo (default)
-    "BAIRRO_ALVO": "ASA SUL",
-    "TIPO_ALVO": "CASA",
 
-    "BAIRRO_ALVO": "LAGO SUL",
+    "BAIRRO_ALVO": "ASA NORTE",
     "TIPO_ALVO": "APARTAMENTO",
     "OFERTA_ALVO": "VENDA",  # aceitos: VENDA, PUBLICADO, etc.
 
@@ -56,7 +54,7 @@ CONFIG = {
     "RANDOM_STATE": 42,
 
     # meses-alvo (padrão)
-    "MESES_ALVO": ["2025-11", "2025-12", "2026-01"],
+    "MESES_ALVO": ["2025-12", "2026-01", "2026-02"],
 
     # cluster fixo: intervalo de treino extra
     "CLUSTER_TREINO_EXTRA_MESES_ANTES": 0,
