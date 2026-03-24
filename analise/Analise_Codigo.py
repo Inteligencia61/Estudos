@@ -1,14 +1,3 @@
-# analise.py
-# ============================================================
-# Lê VÁRIOS CSVs e faz análise com limpeza + análise mensal
-# com clusterização adicional por Luxo e Alto Luxo.
-#
-# Uso:
-#   python ./analise/analise.py 2026-01-04.csv 2026-01-11.csv ...
-#
-# Dependências:
-#   pip install pandas numpy scikit-learn matplotlib
-# ============================================================
 
 from __future__ import annotations
 

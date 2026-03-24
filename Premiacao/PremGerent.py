@@ -480,10 +480,16 @@ def main(sheet_id_contratos=SHEET_ID_CONTRATOS, sheet_id_base=SHEET_ID_BASE_INTE
     df["Data_Contrato"] = pd.to_datetime(df["Data_Contrato"], errors="coerce")
     ultimo_dia = calendar.monthrange(ANO_RELATORIO, MES_RELATORIO)[1]
 
+    #df_mes = df[
+    #    (df["Data_Contrato"] >= f"{ANO_RELATORIO}-{MES_RELATORIO:02d}-01") &
+    #    (df["Data_Contrato"] <= f"{ANO_RELATORIO}-{MES_RELATORIO:02d}-{ultimo_dia}")
+    #].copy()
+
     df_mes = df[
-        (df["Data_Contrato"] >= f"{ANO_RELATORIO}-{MES_RELATORIO:02d}-01") &
-        (df["Data_Contrato"] <= f"{ANO_RELATORIO}-{MES_RELATORIO:02d}-{ultimo_dia}")
+        (df["Data_Contrato"] >= f"2026-01-01") &
+        (df["Data_Contrato"] <= f"2026-12-31")
     ].copy()
+
 
     # 4) Monta mapa oficial corretor -> gerente
     mapa_corretor_gerente, _ = montar_mapa_corretor_gerente(df_dim_corretor, df_dim_gerente)
