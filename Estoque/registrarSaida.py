@@ -14,7 +14,7 @@ from googleapiclient.discovery import build
 CREDENTIALS_JSON = r"../cred.json"
 SPREADSHEET_ID = "1HQDdcbUMj276hnIbPs-WwdWHiUPzMhPRWt4HHRyYGnw"
 
-INPUT_CSV_PATH = "./imoveis-saida-20-03.csv"
+INPUT_CSV_PATH = "./imoveis-saida.csv"
 CSV_SEP = ";"
 CSV_ENCODING = "utf-8-sig"
 
