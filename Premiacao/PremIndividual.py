@@ -388,8 +388,8 @@ def main(file_path=None):
     df['Data_Contrato']=pd.to_datetime(df['Data_Contrato'],errors='coerce')
 
     df_mes=df[
-        (df['Data_Contrato']>='2026-01-01') &
-        (df['Data_Contrato']<='2026-03-26')
+        (df['Data_Contrato']>='2025-11-01') &
+        (df['Data_Contrato']<='2026-12-31')
     ].copy()
 
     res_geral=processar_rankings(df_mes,'CORRETOR')

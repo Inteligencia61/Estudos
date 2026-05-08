@@ -200,7 +200,7 @@ def main(file_path=None):
     # 2. Filtro de Data
     df['Data_Contrato'] = pd.to_datetime(df['Data_Contrato'], errors='coerce')
     #df_mes = df[(df['Data_Contrato'].dt.month == MES_RELATORIO) & (df['Data_Contrato'].dt.year == ANO_RELATORIO)].copy()
-    df_mes = df[(df['Data_Contrato'] >= '2026-02-01') & (df['Data_Contrato'] <= '2026-02-28')]
+    df_mes = df[(df['Data_Contrato'] >= '2026-01-01') & (df['Data_Contrato'] <= '2026-03-31')]
     #print(len(df_mes))
     #print(df_mes['Valor_Negocio'])
     som = 0

@@ -17,9 +17,9 @@ except ImportError:
 # ==========================================================
 MES_RELATORIO = 2
 ANO_RELATORIO = 2026
-TOP_N = 30
+TOP_N = 100
 
-SHEET_ID_CONTRATOS = "1GEAy59-AjpkVuo3I1-ztt1adToDtEPMZrCGz_7B2byY"
+SHEET_ID_CONTRATOS = "1GLYIVuOG0heAXKxL5MdtjNxlR7o9N8BaWuvwHF9Jb0Y"
 SHEET_ID_BASE_INTELIGENCIA = "1v2Id3GE5HZkqq_2eEBt6WG6nVz3U0nnIYH6oS_v3gkA"
 
 ABA_CONTRATOS = "Vendas"
@@ -281,7 +281,7 @@ def processar_rankings_corretores_com_times(df_subset, mapa_corretor_gerente):
 
     for _, row in df_subset.iterrows():
         v_imovel = _to_float_br(row.get("Valor_Negocio", 0))
-        v_comissao_total = _to_float_br(row.get("Valor_Total_61", 0))
+        v_comissao_total = _to_float_br(row.get("Valor_Total_61", 0)) / 0.06
 
         vendedores = obter_vendedores_validos(row)
         captadores = obter_captadores_validos(row)
@@ -397,7 +397,7 @@ def processar_gerentes_via_dim_corretor(df_subset, mapa_corretor_gerente):
 
     for _, row in df_subset.iterrows():
         v_imovel = _to_float_br(row.get("Valor_Negocio", 0))
-        v_comissao_total = _to_float_br(row.get("Valor_Total_61", 0))
+        v_comissao_total = _to_float_br(row.get("Valor_Total_61", 0)) / 0.06
 
         corretores_venda = obter_vendedores_validos(row)
         corretores_capt = obter_captadores_validos(row)
@@ -772,14 +772,18 @@ def main(
 
     if usar_ano_todo:
         df_mes = df[
-            (df["Data_Contrato"] >= f"{ANO_RELATORIO}-01-01") &
-            (df["Data_Contrato"] <= f"{ANO_RELATORIO}-12-31")
+            (df["Data_Contrato"] >= f"2026-04-01") &
+            (df["Data_Contrato"] <= f"2026-12-31")
         ].copy()
     else:
         ultimo_dia = calendar.monthrange(ANO_RELATORIO, MES_RELATORIO)[1]
+        #df_mes = df[
+        #    (df["Data_Contrato"] >= f"{ANO_RELATORIO}-{MES_RELATORIO:02d}-01") &
+        #    (df["Data_Contrato"] <= f"{ANO_RELATORIO}-{MES_RELATORIO:02d}-{ultimo_dia:02d}")
+        #].copy()
         df_mes = df[
-            (df["Data_Contrato"] >= f"{ANO_RELATORIO}-{MES_RELATORIO:02d}-01") &
-            (df["Data_Contrato"] <= f"{ANO_RELATORIO}-{MES_RELATORIO:02d}-{ultimo_dia:02d}")
+            (df["Data_Contrato"] >= f"2026-04-01") &
+            (df["Data_Contrato"] <= f"2026-12-31")
         ].copy()
 
     # 4) Mapa oficial corretor -> gerente
@@ -838,13 +842,13 @@ def main(
 
     # 8) Gera arquivos
     sufixo_periodo = f"{ANO_RELATORIO}_{MES_RELATORIO:02d}" if not usar_ano_todo else f"{ANO_RELATORIO}_ANO_TODO"
-    titulo = f"Relatório de Rankings - {MES_RELATORIO:02d}/{ANO_RELATORIO}" if not usar_ano_todo else f"Relatório de Rankings - Ano {ANO_RELATORIO}"
+    titulo = f"Relatório de Rankings " if not usar_ano_todo else f"Relatório de Rankings - Ano {ANO_RELATORIO}"
 
     tabelas = montar_tabelas_relatorio(res_corretores, res_gerentes, top_n=TOP_N)
 
-    nome_pdf = f"ranking_completo_{sufixo_periodo}.pdf"
-    nome_docx = f"ranking_completo_{sufixo_periodo}.docx"
-    nome_pdf_gerentes = f"ranking_gerentes_detalhado_{sufixo_periodo}.pdf"
+    nome_pdf = f"ranking_completo.pdf"
+    nome_docx = f"ranking_completo.docx"
+    nome_pdf_gerentes = f"ranking_gerentes_detalhado.pdf"
 
     gerar_pdf_ranking(tabelas, nome_pdf, titulo)
     gerar_docx_ranking(tabelas, nome_docx, titulo)

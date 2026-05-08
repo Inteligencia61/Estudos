@@ -179,11 +179,11 @@ class EstudoMercado:
 
     def _pg_connect(self):
         return psycopg2.connect(
-            host=os.getenv("PGHOST", "localhost"),
+            host=os.getenv("PGHOST", "db-restore.ctug6oqcsj14.us-east-2.rds.amazonaws.com"),
             port=int(os.getenv("PGPORT", "5432")),
-            dbname=os.getenv("PGDATABASE", "postgres"),
-            user=os.getenv("PGUSER", "postgres"),
-            password=os.getenv("PGPASSWORD", ""),
+            dbname=os.getenv("PGDATABASE", "coleta_imobiliaria"),
+            user=os.getenv("PGUSER", "inteligencia"),
+            password=os.getenv("PGPASSWORD", "61imoveis"),
         )
 
     def _ensure_schema_and_table(self, conn) -> None:
@@ -784,11 +784,17 @@ if __name__ == "__main__":
     #print(em.ver_dados())
 
     # --- Lote: todos os bairros e tipos ---
-    #em = EstudoMercado()
-    #em.enviar_banco()
+    em = EstudoMercado()
+    em.enviar_banco()
 
     # --- Só carregar dados, sem gravar ---
-    em = EstudoMercado(bairro="NOROESTE", tipo="APARTAMENTO")
-    df = em.carregar_dados()
-    em.gerarGraficoCluster()
-    print(df.tail())
+    #em = EstudoMercado(bairro="ASA NORTE", tipo="APARTAMENTO")
+    #df = em.carregar_dados()
+    #em.gerarGraficoCluster()
+    #somatorio = 0
+    #for a in df['valor_m2']:
+    #    somatorio += a
+    
+    #print(somatorio)
+    #print(somatorio / len(df["valor_m2"]))
+
