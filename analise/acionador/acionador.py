@@ -93,6 +93,13 @@ class EstudoMercado:
     ]
     TIPOS = ["CASA", "APARTAMENTO", "CASA CONDOMINIO"]
     BAIRROS_LUXO = ["LAGO SUL", "LAGO NORTE"]
+    OFERTAS = ["VENDA", "ALUGUEL"]
+
+    # Filtros de preço/m² por tipo de oferta (aplicados no envio em lote)
+    FILTROS_OFERTA: Dict[str, Dict] = {
+        "VENDA":   {"preco_min": 500_000, "preco_max": 50_000_000, "vlm2_min": 1_000, "vlm2_max": 900_000},
+        "ALUGUEL": {"preco_min": 500,     "preco_max": 100_000,    "vlm2_min": 5,     "vlm2_max": 5_000},
+    }
 
     METRAGEM_LABELS = ["<75", "75-90", "90-130", "130-160", "160-200",
                        "200-400", "400-600", "600-800", "800-1000", ">1000"]
@@ -245,7 +252,7 @@ class EstudoMercado:
     def _carregar_do_banco(self, bairro: str, tipo: str,
                            inicio: date, fim: date) -> pd.DataFrame:
         oferta_alvo   = self.oferta
-        ofertas_aceitas = list({oferta_alvo, "PUBLICADO", "VENDA"})
+        ofertas_aceitas = list({oferta_alvo, "PUBLICADO"})
 
         q = psql.SQL("""
             SELECT DISTINCT ON (codigo, data_coleta)
@@ -626,17 +633,22 @@ class EstudoMercado:
 
     def enviar_banco(self) -> None:
         """
-        Envia métricas para TODOS os bairros e tipos definidos em BAIRROS e TIPOS.
+        Envia métricas para TODOS os bairros, tipos e ofertas (VENDA e ALUGUEL).
         """
         with self._pg_connect() as conn:
             self._ensure_schema_and_table(conn)
-            for bairro in self.BAIRROS:
-                for tipo in self.TIPOS:
-                    df_long = self._rodar_pipeline(bairro, tipo)
-                    if df_long.empty:
-                        continue
-                    self._upsert(conn, df_long)
-                    print(f"[OK] {bairro} / {tipo}: {len(df_long)} linhas gravadas.")
+            for oferta in self.OFERTAS:
+                self.oferta = oferta
+                filtros = self.FILTROS_OFERTA.get(oferta, {})
+                for k, v in filtros.items():
+                    setattr(self, k, v)
+                for bairro in self.BAIRROS:
+                    for tipo in self.TIPOS:
+                        df_long = self._rodar_pipeline(bairro, tipo)
+                        if df_long.empty:
+                            continue
+                        self._upsert(conn, df_long)
+                        print(f"[OK] {oferta} / {bairro} / {tipo}: {len(df_long)} linhas gravadas.")
             conn.commit()
         print("Envio em lote concluído.")
 
