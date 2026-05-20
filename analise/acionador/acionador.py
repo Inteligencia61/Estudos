@@ -130,7 +130,7 @@ class EstudoMercado:
         schema_analytics: str = "analytics",
         tbl_metricas: str = "estudo_metricas",
         upsert_page_size: int = 2000,
-        min_amostra_segmento: int = 3,
+        min_amostra_segmento: int = 5,
     ):
         self.data = date.today()
 
@@ -221,6 +221,7 @@ class EstudoMercado:
           m2_mediana     double precision,
           preco_mediana  double precision,
           area_mediana   double precision,
+          variacao_m2_pct double precision,
           gerado_em      timestamp not null default now(),
           primary key (
             bairro, tipo, oferta,
@@ -243,6 +244,8 @@ class EstudoMercado:
             cur.execute(f"""
                 alter table {schema}.{tbl}
                 add column if not exists luxo text not null default '';
+                alter table {schema}.{tbl}
+                add column if not exists variacao_m2_pct double precision;
             """)
 
     # ----------------------------------------------------------
@@ -537,13 +540,35 @@ class EstudoMercado:
             out[col] = out.get(col, "").astype("string").fillna("")
         out["quartos"] = pd.to_numeric(out.get("quartos", -1), errors="coerce").fillna(-1).astype(int)
 
+        out = self._add_variacao_mensal(out)
+
         return out[[
             "bairro", "tipo", "oferta",
             "mes_alvo", "janela_inicio", "janela_fim",
             "mes_ref", "segmento",
             "vaga_cat", "cluster_nome", "quartos", "metragem_fx", "quadra", "luxo",
             "amostra", "m2_medio", "m2_mediana", "preco_mediana", "area_mediana",
+            "variacao_m2_pct",
         ]]
+
+    def _add_variacao_mensal(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calcula variação % de m2_mediana entre meses consecutivos dentro do mesmo segmento."""
+        if df.empty:
+            df["variacao_m2_pct"] = pd.NA
+            return df
+
+        group_keys = [
+            "bairro", "tipo", "oferta", "mes_alvo", "segmento",
+            "vaga_cat", "cluster_nome", "quartos", "metragem_fx", "quadra", "luxo",
+        ]
+        df = df.sort_values(group_keys + ["mes_ref"]).copy()
+        df["variacao_m2_pct"] = (
+            df.groupby(group_keys, dropna=False)["m2_mediana"]
+            .pct_change()
+            .mul(100)
+            .round(2)
+        )
+        return df
 
     # ----------------------------------------------------------
     # Upsert
@@ -555,12 +580,25 @@ class EstudoMercado:
 
         schema = self.schema_analytics
         tbl    = self.tbl_metricas
-        cols   = [
+
+        # Remove linhas existentes para o escopo sendo reprocessado antes de inserir,
+        # evitando dependência de constraint específico no ON CONFLICT.
+        combos = df_long[["bairro", "tipo", "oferta", "mes_alvo"]].drop_duplicates()
+        del_q = psql.SQL(
+            "delete from {schema}.{tbl} "
+            "where bairro = %s and tipo = %s and oferta = %s and mes_alvo = %s"
+        ).format(schema=psql.Identifier(schema), tbl=psql.Identifier(tbl))
+        with conn.cursor() as cur:
+            for _, row in combos.iterrows():
+                cur.execute(del_q, (row["bairro"], row["tipo"], row["oferta"], row["mes_alvo"]))
+
+        cols = [
             "bairro", "tipo", "oferta",
             "mes_alvo", "janela_inicio", "janela_fim",
             "mes_ref", "segmento",
             "vaga_cat", "cluster_nome", "quartos", "metragem_fx", "quadra", "luxo",
             "amostra", "m2_medio", "m2_mediana", "preco_mediana", "area_mediana",
+            "variacao_m2_pct",
         ]
         payload = [
             tuple(r[c] if pd.notna(r[c]) else None for c in cols)
@@ -572,9 +610,9 @@ class EstudoMercado:
               mes_alvo, janela_inicio, janela_fim,
               mes_ref, segmento,
               vaga_cat, cluster_nome, quartos, metragem_fx, quadra, luxo,
-              amostra, m2_medio, m2_mediana, preco_mediana, area_mediana
+              amostra, m2_medio, m2_mediana, preco_mediana, area_mediana,
+              variacao_m2_pct
             ) values %s
-            on conflict do nothing
         """).format(schema=psql.Identifier(schema), tbl=psql.Identifier(tbl))
 
         with conn.cursor() as cur:
