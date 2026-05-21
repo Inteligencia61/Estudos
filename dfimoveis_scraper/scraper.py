@@ -283,7 +283,11 @@ def regex_group(text: str, pattern: str) -> str:
     return match.group(1) if match else ""
 
 
-def scrape(config: ScrapeConfig, arquivo_listagem: Path | None = None) -> list[dict[str, str]]:
+def scrape(
+    config: ScrapeConfig,
+    arquivo_listagem: Path | None = None,
+    checkpoint_path: Path | None = None,
+) -> list[dict[str, str]]:
     session = requests.Session()
     session.headers.update(
         {
@@ -314,6 +318,8 @@ def scrape(config: ScrapeConfig, arquivo_listagem: Path | None = None) -> list[d
                 except requests.RequestException as exc:
                     print(f"Falha no detalhe {row['link']}: {exc}", file=sys.stderr)
             rows.append({field: row.get(field, "") for field in CSV_FIELDS})
+            if checkpoint_path:
+                write_csv(rows, checkpoint_path)
             if config.limite and len(rows) >= config.limite:
                 return True
         return False
@@ -332,7 +338,13 @@ def scrape(config: ScrapeConfig, arquivo_listagem: Path | None = None) -> list[d
                 break
             url = build_listing_url(oferta, pagina)
             print(f"Baixando listagem: {url}", file=sys.stderr)
-            raw = fetch(session, url, config.timeout)
+            try:
+                raw = fetch(session, url, config.timeout)
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    print(f"Parando {oferta}: pagina {pagina} retornou 404.", file=sys.stderr)
+                    break
+                raise
             cards = parse_listing(raw)
             print(f"{url}: {len(cards)} imoveis encontrados", file=sys.stderr)
             if not cards:
@@ -382,8 +394,8 @@ def main() -> int:
         timeout=args.timeout,
         limite=args.limite,
     )
-    rows = scrape(config, args.arquivo_listagem)
     output_path = Path(args.saida) if args.saida else Path(f"{date.today().isoformat()}.csv")
+    rows = scrape(config, args.arquivo_listagem, output_path)
     write_csv(rows, output_path)
     print(f"CSV gerado: {output_path} ({len(rows)} linhas)")
     return 0
