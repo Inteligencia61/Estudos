@@ -2,6 +2,8 @@
 
 Scraper em Python para capturar anuncios de venda e aluguel no DF Imoveis usando paginacao por URL.
 
+Por padrao ele percorre cidade/bairro nas cidades grandes e cidade direta nas regioes menores para evitar o limite de resultados do site na busca geral.
+
 ## Instalar
 
 ```powershell
@@ -13,27 +15,57 @@ pip install -r requirements.txt
 
 ## Rodar
 
-Venda ate a primeira pagina vazia:
+Venda por cidade/bairro, ou cidade direta, ate a primeira pagina vazia de cada escopo:
 
 ```powershell
 python scraper.py --oferta venda --inicio 1
 ```
 
-Aluguel ate a primeira pagina vazia:
+Aluguel por cidade/bairro, ou cidade direta, ate a primeira pagina vazia de cada escopo:
 
 ```powershell
 python scraper.py --oferta aluguel --inicio 1
 ```
 
-Venda e aluguel no mesmo CSV, cada um ate a primeira pagina vazia:
+Venda e aluguel no mesmo CSV, cada escopo ate a primeira pagina vazia:
 
 ```powershell
 python scraper.py --oferta ambos --inicio 1
 ```
 
+O mapeamento atual inclui:
+
+- `brasilia`: asa norte, asa sul, altiplano leste, granja do torto, jardim botanico, jardins mangueiral, lago norte, lago sul, noroeste, octogonal, park sul, park way, setor industrial, setor tororo, sig, sudoeste, taquari, vila da telebrasilia, vila planalto, zona civico administrativa, zona rural
+- `aguas claras`: ade, areal, arniqueira, norte, sul
+- cidades sem bairro: aguas lindas de goias, alphaville, brazlandia, candangolandia, ceilandia, cidade ocidental, cruzeiro, formosa, gama, guara, jardim botanico, luziania, nucleo bandeirante, paranoa, planaltina, planaltina de goias, riacho fundo, samambaia, santa maria, santo antonio do descoberto, sao sebastiao, setor industrial, sobradinho, taguatinga, valparaiso de goias, varjao, vicente pires, vila estrutural
+
+Para rodar apenas uma cidade:
+
+```powershell
+python scraper.py --oferta venda --cidades "brasilia"
+```
+
+Cidade sem bairro:
+
+```powershell
+python scraper.py --oferta venda --cidades "alphaville"
+```
+
+Para rodar apenas uma cidade e um bairro:
+
+```powershell
+python scraper.py --oferta venda --cidades "brasilia" --bairros "altiplano leste"
+```
+
+Se quiser usar a estrategia antiga da busca geral `/df/todos`, informe:
+
+```powershell
+python scraper.py --oferta venda --escopo todos
+```
+
 Quando `--saida` nao e informado, o arquivo recebe a data da coleta, por exemplo `2026-05-20.csv`.
 
-Para limitar manualmente as paginas, use `--fim`:
+Para limitar manualmente as paginas por escopo, use `--fim`:
 
 ```powershell
 python scraper.py --oferta ambos --inicio 1 --fim 5 --saida amostra_paginas.csv

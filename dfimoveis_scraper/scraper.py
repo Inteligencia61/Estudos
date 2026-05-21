@@ -7,6 +7,7 @@ import json
 import re
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -38,6 +39,76 @@ CSV_FIELDS = [
     "quadra",
     "data",
 ]
+BAIRROS_POR_CIDADE = {
+    "brasilia": [
+        "asa norte",
+        "asa sul",
+        "altiplano leste",
+        "granja do torto",
+        "jardim botanico",
+        "jardins mangueiral",
+        "lago norte",
+        "lago sul",
+        "noroeste",
+        "octogonal",
+        "park sul",
+        "park way",
+        "setor industrial",
+        "setor tororo",
+        "sig",
+        "sudoeste",
+        "taquari",
+        "vila da telebrasilia",
+        "vila planalto",
+        "zona civico administrativa",
+        "zona rural",
+    ],
+    "aguas claras": [
+        "ade",
+        "areal",
+        "arniqueira",
+        "norte",
+        "sul",
+    ],
+}
+CIDADES_SEM_BAIRRO = [
+    "aguas lindas de goias",
+    "alphaville",
+    "brazlandia",
+    "candangolandia",
+    "ceilandia",
+    "cidade ocidental",
+    "cruzeiro",
+    "formosa",
+    "gama",
+    "guara",
+    "jardim botanico",
+    "luziania",
+    "nucleo bandeirante",
+    "paranoa",
+    "planaltina",
+    "planaltina de goias",
+    "riacho fundo",
+    "samambaia",
+    "santa maria",
+    "santo antonio do descoberto",
+    "sao sebastiao",
+    "setor industrial",
+    "sobradinho",
+    "taguatinga",
+    "valparaiso de goias",
+    "varjao",
+    "vicente pires",
+    "vila estrutural",
+]
+CIDADE_ALIASES = {
+    "aguas-lindas-de-goiais": "aguas lindas de goias",
+    "jardim-botanico": "jardim botanico",
+    "luziana": "luziania",
+    "planaltina-de-goiais": "planaltina de goias",
+    "sao-sebastiao": "sao sebastiao",
+    "valparaiso-de-goiais": "valparaiso de goias",
+}
 
 
 @dataclass(frozen=True)
@@ -49,6 +120,23 @@ class ScrapeConfig:
     detalhes: bool
     timeout: int
     limite: int | None
+    escopo: str
+    cidades: list[str] | None
+    bairros: list[str] | None
+
+
+@dataclass(frozen=True)
+class ListingScope:
+    cidade: str | None = None
+    bairro: str | None = None
+
+    @property
+    def label(self) -> str:
+        if self.cidade and self.bairro:
+            return f"{self.cidade}/{self.bairro}"
+        if self.cidade:
+            return self.cidade
+        return "todos"
 
 
 def normalize_space(value: str | None) -> str:
@@ -72,6 +160,19 @@ def only_digits(value: str | None) -> str:
     if not value:
         return ""
     return re.sub(r"\D+", "", value)
+
+
+def slugify(value: str) -> str:
+    value = normalize_space(value).lower()
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    return value.strip("-")
+
+
+def normalize_city_key(value: str) -> str:
+    city = normalize_space(value).lower()
+    return CIDADE_ALIASES.get(slugify(city), city)
 
 
 def parse_decimal_text(value: str | None) -> str:
@@ -110,8 +211,44 @@ def fetch(session: requests.Session, url: str, timeout: int) -> str:
     return response.text
 
 
-def build_listing_url(oferta: str, pagina: int) -> str:
+def build_listing_url(oferta: str, pagina: int, scope: ListingScope | None = None) -> str:
+    if scope and scope.cidade and scope.bairro:
+        cidade = slugify(scope.cidade)
+        bairro = slugify(scope.bairro)
+        return f"{BASE_URL}/{oferta}/df/{cidade}/{bairro}/imoveis?pagina={pagina}"
+    if scope and scope.cidade:
+        cidade = slugify(scope.cidade)
+        return f"{BASE_URL}/{oferta}/df/{cidade}/imoveis?pagina={pagina}"
     return f"{BASE_URL}/{oferta}/df/todos/imoveis?pagina={pagina}"
+
+
+def parse_csv_arg(value: str | None) -> list[str] | None:
+    if not value:
+        return None
+    values = [normalize_space(item).lower() for item in value.split(",")]
+    return [item for item in values if item]
+
+
+def build_scopes(config: ScrapeConfig) -> list[ListingScope]:
+    if config.escopo == "todos":
+        return [ListingScope()]
+
+    selected_cities = config.cidades or [*BAIRROS_POR_CIDADE, *CIDADES_SEM_BAIRRO]
+    scopes: list[ListingScope] = []
+    for cidade in selected_cities:
+        city_key = normalize_city_key(cidade)
+        if city_key not in BAIRROS_POR_CIDADE:
+            if city_key not in CIDADES_SEM_BAIRRO:
+                valid = ", ".join([*BAIRROS_POR_CIDADE, *CIDADES_SEM_BAIRRO])
+                raise SystemExit(f"Cidade sem mapeamento: {cidade}. Cidades disponiveis: {valid}")
+            if config.bairros:
+                raise SystemExit(f"A cidade {cidade} esta configurada sem bairros. Remova --bairros para usa-la.")
+            scopes.append(ListingScope(cidade=city_key))
+            continue
+        selected_bairros = config.bairros or BAIRROS_POR_CIDADE[city_key]
+        for bairro in selected_bairros:
+            scopes.append(ListingScope(cidade=city_key, bairro=normalize_space(bairro).lower()))
+    return scopes
 
 
 def text_of(element) -> str:
@@ -332,28 +469,29 @@ def scrape(
         return rows
 
     for oferta in ofertas:
-        pagina = config.inicio
-        while True:
-            if config.fim is not None and pagina > config.fim:
-                break
-            url = build_listing_url(oferta, pagina)
-            print(f"Baixando listagem: {url}", file=sys.stderr)
-            try:
-                raw = fetch(session, url, config.timeout)
-            except requests.HTTPError as exc:
-                if exc.response is not None and exc.response.status_code == 404:
-                    print(f"Parando {oferta}: pagina {pagina} retornou 404.", file=sys.stderr)
+        for scope in build_scopes(config):
+            pagina = config.inicio
+            while True:
+                if config.fim is not None and pagina > config.fim:
                     break
-                raise
-            cards = parse_listing(raw)
-            print(f"{url}: {len(cards)} imoveis encontrados", file=sys.stderr)
-            if not cards:
-                print(f"Parando {oferta}: pagina {pagina} sem imoveis.", file=sys.stderr)
-                break
-            if add_cards(cards):
-                return rows
-            pagina += 1
-            time.sleep(config.delay)
+                url = build_listing_url(oferta, pagina, scope)
+                print(f"Baixando listagem: {url}", file=sys.stderr)
+                try:
+                    raw = fetch(session, url, config.timeout)
+                except requests.HTTPError as exc:
+                    if exc.response is not None and exc.response.status_code == 404:
+                        print(f"Parando {oferta}/{scope.label}: pagina {pagina} retornou 404.", file=sys.stderr)
+                        break
+                    raise
+                cards = parse_listing(raw)
+                print(f"{url}: {len(cards)} imoveis encontrados", file=sys.stderr)
+                if not cards:
+                    print(f"Parando {oferta}/{scope.label}: pagina {pagina} sem imoveis.", file=sys.stderr)
+                    break
+                if add_cards(cards):
+                    return rows
+                pagina += 1
+                time.sleep(config.delay)
 
     return rows
 
@@ -377,6 +515,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limite", type=int, help="Numero maximo de imoveis para capturar.")
     parser.add_argument("--sem-detalhes", action="store_true", help="Nao abrir paginas individuais dos imoveis.")
     parser.add_argument("--arquivo-listagem", type=Path, help="HTML local de uma listagem para teste.")
+    parser.add_argument(
+        "--escopo",
+        choices=["bairros", "todos"],
+        default="bairros",
+        help="Modo bairros percorre cidade/bairro; todos usa a URL antiga /df/todos.",
+    )
+    parser.add_argument("--cidades", help="Lista separada por virgula. Ex: brasilia,aguas claras.")
+    parser.add_argument("--bairros", help="Lista separada por virgula para usar nas cidades selecionadas.")
     return parser.parse_args()
 
 
@@ -393,6 +539,9 @@ def main() -> int:
         detalhes=not args.sem_detalhes,
         timeout=args.timeout,
         limite=args.limite,
+        escopo=args.escopo,
+        cidades=parse_csv_arg(args.cidades),
+        bairros=parse_csv_arg(args.bairros),
     )
     output_path = Path(args.saida) if args.saida else Path(f"{date.today().isoformat()}.csv")
     rows = scrape(config, args.arquivo_listagem, output_path)
