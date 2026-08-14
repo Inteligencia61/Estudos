@@ -24,10 +24,10 @@ from googleapiclient.discovery import build
 CREDENTIALS_JSON = r"../cred.json"
 SPREADSHEET_ID = "1HQDdcbUMj276hnIbPs-WwdWHiUPzMhPRWt4HHRyYGnw"
 
-# --- CSV de entrada ---
-CSV_PATH = r"./cap-05-08.csv"
-CSV_SEP = ";"
-CSV_ENCODING = "utf-8-sig"
+# --- Arquivo de entrada (export do Imoview: .xlsx, .xls ou .csv) ---
+CSV_PATH = r"./cap-08-07.xlsx"
+CSV_SEP = ";"            # usado apenas quando a entrada é .csv
+CSV_ENCODING = "utf-8-sig"  # usado apenas quando a entrada é .csv
 
 # --- Filtros opcionais do CSV ---
 FILTRAR_FINALIDADE = "Venda"    # ex: "Venda" / "Aluguel" / "" para não filtrar
@@ -233,18 +233,37 @@ def cell_to_sheet_value(x: Any):
 
 
 # =========================
-# CSV
+# ENTRADA (CSV / XLS / XLSX)
 # =========================
 def load_csv_as_df(csv_path: str) -> pd.DataFrame:
+    """
+    Lê o export do Imoview em qualquer formato que ele já usou:
+      - .xlsx / .xlsm -> Excel nativo (openpyxl)
+      - .xls          -> Excel nativo; se falhar, HTML disfarçado (read_html)
+      - .csv          -> tenta CSV_SEP e cai para ',' se vier em coluna única
+    """
     if not os.path.exists(csv_path):
-        raise RuntimeError(f"CSV não encontrado: {csv_path}")
+        raise RuntimeError(f"Arquivo de entrada não encontrado: {csv_path}")
 
-    df = pd.read_csv(
-        csv_path,
-        sep=CSV_SEP,
-        encoding=CSV_ENCODING,
-        engine="python"
-    )
+    ext = os.path.splitext(csv_path)[1].lower()
+
+    if ext in (".xlsx", ".xlsm"):
+        df = pd.read_excel(csv_path, engine="openpyxl")
+
+    elif ext == ".xls":
+        try:
+            df = pd.read_excel(csv_path)
+        except Exception:
+            # Export clássico do Imoview: ".xls" que na verdade é HTML
+            tabelas = pd.read_html(csv_path, flavor="lxml")
+            if not tabelas:
+                raise RuntimeError(f"Não foi possível ler o arquivo: {csv_path}")
+            df = max(tabelas, key=lambda t: t.shape[0] * t.shape[1]).copy()
+
+    else:
+        df = pd.read_csv(csv_path, sep=CSV_SEP, encoding=CSV_ENCODING, engine="python")
+        if df.shape[1] <= 1:
+            df = pd.read_csv(csv_path, sep=",", encoding=CSV_ENCODING, engine="python")
 
     df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
     return df

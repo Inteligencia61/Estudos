@@ -5,8 +5,8 @@ from datetime import datetime
 # =========================
 # CONFIG
 # =========================
-INPUT_XLS = "./imoveis-2026-05-08-124448.xls" # seu export do Imoview (HTML disfarçado de .xls)
-OUTPUT_XLSX = "./Fato_Estoque_IMPORTAR.xlsx"   # ESTE é o arquivo que você vai importar no App Script
+INPUT_FILE = "./imoveis-2026-08-07.xlsx"  # Altere para o caminho do seu arquivo (.xlsx ou .csv)
+OUTPUT_XLSX = "./Fato_Estoque_IMPORTAR.xlsx"  # Arquivo pronto para o Apps Script
 
 # Data do estoque como data real (célula de Excel)
 DATA_ESTOQUE = datetime.now().date()
@@ -22,6 +22,9 @@ def clean_str(v) -> str:
             return ""
     except Exception:
         pass
+    # Se for número inteiro float vindo do pandas (ex: 12320.0), converte para string sem decimal
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
     s = str(v).strip()
     if s.lower() in {"nan", "none", "null"}:
         return ""
@@ -31,7 +34,7 @@ def split_captadores(valor: str):
     """
     No Imoview, 'Captadores' costuma vir assim:
       "Nome 1 | Nome 2 | Nome 3"
-    Vamos gerar Captador1..3 (nomes).
+    Gera Captador1..3 (nomes).
     """
     s = clean_str(valor)
     if not s:
@@ -42,55 +45,76 @@ def split_captadores(valor: str):
     return parts[0], parts[1], parts[2]
 
 # =========================
-# LEITURA DO "XLS" (HTML)
+# LEITURA DO ARQUIVO (.XLSX / .CSV / .XLS)
 # =========================
-tables = pd.read_html(INPUT_XLS, flavor="lxml")
-if not tables:
-    raise ValueError("Não encontrei nenhuma tabela dentro do arquivo .xls (HTML).")
+print(f"Lendo arquivo: {INPUT_FILE}...")
 
-# Pega a maior tabela (geralmente é a do estoque)
-df = max(tables, key=lambda t: t.shape[0] * t.shape[1]).copy()
+if INPUT_FILE.lower().endswith(".csv"):
+    # Tenta ler CSV testando separadores comuns (; e ,)
+    try:
+        df = pd.read_csv(INPUT_FILE, sep=";", dtype=str, encoding="utf-8-sig")
+        if len(df.columns) <= 1:
+            df = pd.read_csv(INPUT_FILE, sep=",", dtype=str, encoding="utf-8-sig")
+    except Exception:
+        df = pd.read_csv(INPUT_FILE, sep=",", dtype=str, encoding="utf-8-sig")
+else:
+    # Tenta ler como Excel XLSX/XLS nativo
+    try:
+        df = pd.read_excel(INPUT_FILE, dtype=str)
+    except Exception:
+        # Fallback para HTML disfarçado de XLS (se for o export clássico do Imoview)
+        tables = pd.read_html(INPUT_FILE, flavor="lxml")
+        if not tables:
+            raise ValueError("Não foi possível ler o arquivo fornecido.")
+        df = max(tables, key=lambda t: t.shape[0] * t.shape[1]).copy()
 
 # =========================
 # VALIDAR COLUNAS DO EXPORT
 # =========================
-# Código pode vir como "Codigo" (sem acento) no export
-if "Codigo" not in df.columns and "Código" not in df.columns:
-    raise ValueError(f"Não encontrei coluna de código. Colunas disponíveis: {list(df.columns)}")
+cols_lower = {str(col).strip().lower(): col for col in df.columns}
 
-col_codigo = "Codigo" if "Codigo" in df.columns else "Código"
+if "codigo" in cols_lower:
+    col_codigo = cols_lower["codigo"]
+elif "código" in cols_lower:
+    col_codigo = cols_lower["código"]
+else:
+    raise ValueError(f"Não encontrei a coluna 'Codigo' ou 'Código'. Colunas encontradas: {list(df.columns)}")
 
-# Captadores pode vir como "Captadores" ou outra variação
-if "Captadores" not in df.columns:
-    # se não existir, cria vazio (não quebra)
+if "captadores" in cols_lower:
+    col_captadores = cols_lower["captadores"]
+else:
     df["Captadores"] = ""
+    col_captadores = "Captadores"
 
 # =========================
 # GERAR Captador1..3 (NOMES)
 # =========================
-caps = df["Captadores"].apply(split_captadores)
+caps = df[col_captadores].apply(split_captadores)
 df["Captador1"] = caps.apply(lambda x: x[0])
 df["Captador2"] = caps.apply(lambda x: x[1])
 df["Captador3"] = caps.apply(lambda x: x[2])
 
 # =========================
 # SAÍDA EXATA PARA processFile(data)
-# (6 COLUNAS, com DataEstoque na COLUNA F)
+# (6 COLUNAS: A=Codigo, B=Captador1, C=Captador2, D=Captador3, E=Gerente, F=DataEstoque)
 # =========================
 out = pd.DataFrame({
-    "Codigo": df[col_codigo].apply(clean_str),   # A
-    "Captador1": df["Captador1"],                # B (nome)
-    "Captador2": df["Captador2"],                # C (nome)
-    "Captador3": df["Captador3"],                # D (nome)
-    "Gerente": "",                               # E (pode vazio; GAS preenche)
-    "DataEstoque": DATA_ESTOQUE,                 # F (data real no Excel)
+    "Codigo": df[col_codigo].apply(clean_str),    # A
+    "Captador1": df["Captador1"],                 # B
+    "Captador2": df["Captador2"],                 # C
+    "Captador3": df["Captador3"],                 # D
+    "Gerente": "",                                # E (vazio para o Apps Script preencher)
+    "DataEstoque": pd.to_datetime(DATA_ESTOQUE),  # F (Data nativa de Excel)
 })
 
-# (Opcional) remover linhas sem código
+# Remover linhas sem código
 out = out[out["Codigo"].astype(str).str.strip().ne("")].copy()
 
-# Salvar XLSX (com data como célula de data)
-out.to_excel(OUTPUT_XLSX, index=False)
+# =========================
+# SALVAR XLSX COM FORMATO DE DATA
+# =========================
+with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl", date_format="YYYY-MM-DD", datetime_format="YYYY-MM-DD") as writer:
+    out.to_excel(writer, index=False)
 
-print("OK! XLSX compatível gerado:", OUTPUT_XLSX)
+print("OK! XLSX compatível gerado com sucesso:", OUTPUT_XLSX)
 print(out.head(10))

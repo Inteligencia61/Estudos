@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -73,7 +74,7 @@ class EstudoMercado:
       - Construção de métricas long
       - Upsert no banco
       - Visualização e resumo
-    
+
     Uso individual (um bairro/tipo):
         em = EstudoMercado(bairro="ASA SUL", tipo="CASA")
         em.enviar_banco_individual()
@@ -101,9 +102,101 @@ class EstudoMercado:
         "ALUGUEL": {"preco_min": 500,     "preco_max": 100_000,    "vlm2_min": 5,     "vlm2_max": 5_000},
     }
 
+    # O topo era um balde único ">1000", onde vive quase todo o ALTO LUXO —
+    # sobravam poucas linhas no segmento METRAGEM_VAGA. Dividido em
+    # 1000-1500 / 1500-2000 / 2000-3000 / >3000 (03/08/2026).
+    # As faixas abaixo de 1000 não mudaram: imóvel nenhum troca de faixa fora do topo.
     METRAGEM_LABELS = ["<75", "75-90", "90-130", "130-160", "160-200",
-                       "200-400", "400-600", "600-800", "800-1000", ">1000"]
-    METRAGEM_BINS   = [0, 75, 90, 130, 160, 200, 400, 600, 800, 1000, 10_000_000]
+                       "200-400", "400-600", "600-800", "800-1000",
+                       "1000-1500", "1500-2000", "2000-3000", ">3000"]
+    METRAGEM_BINS   = [0, 75, 90, 130, 160, 200, 400, 600, 800, 1000,
+                       1500, 2000, 3000, 10_000_000]
+
+    # ----------------------------------------------------------
+    # Configuração do cluster de condição (Original / Reformado / Nova)
+    # ----------------------------------------------------------
+    # Padrão histórico: KMeans k=9 sobre [valor_m2, area_util], com os 9 centros
+    # ordenados por valor_m2 e agrupados 3 a 3.
+    CLUSTER_FEATURES  = ["valor_m2", "area_util"]
+    CLUSTER_N_PADRAO  = 9
+
+    # Override por bairro. Só o LAGO NORTE usa a configuração nova (03/08/2026):
+    # k=3 sobre apenas `valor_m2`.
+    #   - `area_util` fazia o KMeans separar por TAMANHO, não por condição: os
+    #     outliers de área capturavam um centro inteiro e deixavam um dos três
+    #     rótulos residual (0,4%).
+    #   - com k=9 + 2 features, remover ~0,2% das linhas da base reatribuía
+    #     ~20% dos imóveis de rótulo (instabilidade entre rodadas).
+    #   - k=3 sobre valor_m2: distribuição 25/51/24 e instabilidade 0,7%.
+    # Os demais bairros seguem no padrão para não exigir regravação em massa.
+    # A primeira feature é a usada para ordenar os centros e atribuir o rótulo.
+    CLUSTER_CONFIG: Dict[str, Dict[str, Any]] = {
+        "LAGO NORTE": {"n_clusters": 3, "features": ["valor_m2"]},
+    }
+
+    # Identifica uma "série" dentro de uma janela de mês-alvo: é o conjunto de
+    # pontos (um por mes_ref) que forma UMA linha no gráfico de evolução.
+    # Tudo menos `mes_ref` e as métricas.
+    CHAVE_SERIE = ["segmento", "vaga_cat", "cluster_nome",
+                   "quartos", "metragem_fx", "quadra", "luxo"]
+
+    # ----------------------------------------------------------
+    # Regras específicas dos lagos (LAGO SUL e LAGO NORTE)
+    # ----------------------------------------------------------
+
+    # Bairros que usam o conjunto de regras dos lagos:
+    #   - faixas fixas de preço para luxo (em vez do KMeans)
+    #   - agrupamento de quadras QI/QL em Início / Meio / Final
+    #   - nomenclatura simplificada de cluster (Original / Reformado / Nova)
+    BAIRROS_LAGOS = ["LAGO SUL", "LAGO NORTE"]
+
+    # Faixas fixas de preço para classificação de luxo (substitui o KMeans
+    # nos bairros de BAIRROS_LAGOS).
+    LUXO_FAIXAS_LAGOS: Dict[str, float] = {
+        "luxo_min": 2_500_000,      # a partir daqui já é LUXO
+        "alto_luxo_min": 8_000_000, # acima disso é ALTO LUXO
+    }
+
+    # Agrupamento de quadras QI/QL em Início / Meio / Final.
+    # As faixas são POR BAIRRO porque a numeração é diferente em cada lago:
+    #   - LAGO SUL  (SHIS): QI ímpar 1-29 · QL par 2-28
+    #   - LAGO NORTE (SHIN): QI e QL de 1 a 16, com pares e ímpares
+    # Quadra cujo número não esteja em nenhuma faixa vira "" e sai do
+    # segmento QUADRA_VAGA — por isso as faixas precisam cobrir toda a
+    # numeração existente no bairro.
+    QUADRA_FAIXAS: Dict[str, Dict[str, Dict[str, set]]] = {
+        "LAGO SUL": {
+            "QI": {
+                "Início": {1, 3, 5},
+                "Meio":   {7, 9, 11, 13, 15, 16},
+                "Final":  {17, 19, 21, 23, 25, 26, 27, 28, 29},
+            },
+            "QL": {
+                "Início": {2, 4, 6},
+                "Meio":   {8, 10, 14, 16},
+                "Final":  {18, 20, 22, 24, 26, 28},
+            },
+        },
+        # LAGO NORTE — divisão informada pelo especialista do bairro.
+        # Lado par e lado ímpar são geograficamente equivalentes e caem no
+        # mesmo bloco:
+        #   Início -> ímpar 1-5   · par 2-6
+        #   Meio   -> ímpar 7-9   · par 8-10
+        #   Final  -> ímpar 11-15 · par 12-16
+        # Mesma divisão para QI e QL.
+        "LAGO NORTE": {
+            "QI": {
+                "Início": {1, 2, 3, 4, 5, 6},
+                "Meio":   {7, 8, 9, 10},
+                "Final":  {11, 12, 13, 14, 15, 16},
+            },
+            "QL": {
+                "Início": {1, 2, 3, 4, 5, 6},
+                "Meio":   {7, 8, 9, 10},
+                "Final":  {11, 12, 13, 14, 15, 16},
+            },
+        },
+    }
 
     def __init__(
         self,
@@ -121,6 +214,7 @@ class EstudoMercado:
         aplicar_iqr: bool = True,
         # cluster
         clusters_ativos: bool = True,
+        # Fallback: usado nos bairros sem entrada em CLUSTER_CONFIG.
         kmeans_n_clusters: int = 9,
         random_state: int = 42,
         min_amostra_cluster: int = 10,
@@ -131,6 +225,9 @@ class EstudoMercado:
         tbl_metricas: str = "estudo_metricas",
         upsert_page_size: int = 2000,
         min_amostra_segmento: int = 5,
+        # True  = corte por série (mantém a linha do gráfico de evolução)
+        # False = corte por ponto (comportamento anterior)
+        corte_por_serie: bool = True,
     ):
         self.data = date.today()
 
@@ -167,6 +264,7 @@ class EstudoMercado:
         self.tbl_metricas      = tbl_metricas
         self.upsert_page_size  = upsert_page_size
         self.min_amostra_segmento = min_amostra_segmento
+        self.corte_por_serie      = corte_por_serie
 
         # estado interno
         self.df_analisado: Optional[pd.DataFrame] = None   # dados brutos carregados
@@ -321,6 +419,32 @@ class EstudoMercado:
             return df
         return df[(df[coluna] >= q1 - 1.5 * iqr) & (df[coluna] <= q3 + 1.5 * iqr)].copy()
 
+    def _bairro_usa_regra_lagos(self, bairro: str) -> bool:
+        return str(bairro).strip().upper() in {b.upper() for b in self.BAIRROS_LAGOS}
+
+    def _mapear_quadra_lagos(self, quadra: Optional[str], bairro: str) -> str:
+        """
+        Agrupa as quadras dos lagos (LAGO SUL e LAGO NORTE) em blocos
+        Início / Meio / Final, separadamente para QI e QL, usando as faixas do
+        bairro em QUADRA_FAIXAS. Quadras fora das faixas (ou não identificadas)
+        retornam string vazia, igual ao comportamento padrão.
+        """
+        faixas = self.QUADRA_FAIXAS.get(str(bairro).strip().upper())
+        if not faixas or not quadra:
+            return ""
+
+        m = re.search(r"\bQ([IL])\s*0*?(\d+)\b", str(quadra).upper())
+        if not m:
+            return ""
+
+        prefixo = "Q" + m.group(1)   # "QI" ou "QL"
+        numero  = int(m.group(2))
+
+        for bloco, numeros in faixas.get(prefixo, {}).items():
+            if numero in numeros:
+                return f"{prefixo} - {bloco}"
+        return ""
+
     def _limpar_dados(self, df: pd.DataFrame) -> pd.DataFrame:
         df = df.copy().dropna(subset=["preco", "area_util"])
         df["valor_m2"] = df["preco"] / df["area_util"]
@@ -347,6 +471,19 @@ class EstudoMercado:
             df["quadra"].astype("string").fillna("").str.strip().str.upper()
             if "quadra" in df.columns else ""
         )
+
+        # LAGO SUL / LAGO NORTE: substitui a quadra bruta pelo agrupamento
+        # QI/QL Início/Meio/Final
+        if "bairro" in df.columns and df["bairro"].notna().any():
+            bairro_ref = str(df["bairro"].dropna().iloc[0]).strip().upper()
+            if self._bairro_usa_regra_lagos(bairro_ref):
+                df["quadra"] = (
+                    df["quadra"]
+                    .apply(lambda q: self._mapear_quadra_lagos(q, bairro_ref))
+                    .astype("string")
+                    .fillna("")
+                )
+
         df["luxo"] = ""
         return df
 
@@ -354,31 +491,56 @@ class EstudoMercado:
     # Clusterização padrão
     # ----------------------------------------------------------
 
-    def _treinar_cluster_global(self, df_treino: pd.DataFrame):
+    def _cluster_feats(self, bairro: str) -> List[str]:
+        """Features do cluster de condição para o bairro (ver CLUSTER_CONFIG)."""
+        cfg = self.CLUSTER_CONFIG.get(str(bairro).strip().upper(), {})
+        return list(cfg.get("features", self.CLUSTER_FEATURES))
+
+    def _cluster_k(self, bairro: str) -> int:
+        """Nº de centros do KMeans para o bairro (ver CLUSTER_CONFIG)."""
+        cfg = self.CLUSTER_CONFIG.get(str(bairro).strip().upper(), {})
+        return int(cfg.get("n_clusters", self.kmeans_n_clusters))
+
+    def _treinar_cluster_global(self, df_treino: pd.DataFrame, bairro: str = ""):
         if not SKLEARN_OK:
             raise RuntimeError("sklearn indisponível.")
         if len(df_treino) < self.min_amostra_cluster:
             raise RuntimeError("Amostra insuficiente para cluster global.")
 
-        feats = ["valor_m2", "area_util"]
+        feats = self._cluster_feats(bairro)
         base  = df_treino.dropna(subset=feats)
         if len(base) < self.min_amostra_cluster:
             raise RuntimeError("Amostra insuficiente (pós dropna) para cluster global.")
 
         scaler = StandardScaler()
         X = scaler.fit_transform(base[feats])
-        km = KMeans(n_clusters=self.kmeans_n_clusters,
+        km = KMeans(n_clusters=self._cluster_k(bairro),
                     random_state=self.random_state, n_init=10)
         km.fit(X)
 
         centers_real = scaler.inverse_transform(km.cluster_centers_)
         order = pd.DataFrame(centers_real, columns=feats).sort_values("valor_m2").index.tolist()
-        labels  = ["01 - Original", "02 - Semi-Reformado", "03 - Reformado"]
-        mapping = {cid: labels[min(i // 3, 2)] for i, cid in enumerate(order)}
+
+        # LAGO SUL / LAGO NORTE usam a nomenclatura simplificada
+        # Original / Reformado / Nova
+        if self._bairro_usa_regra_lagos(bairro):
+            labels = ["Original", "Reformado", "Nova"]
+        else:
+            labels = ["01 - Original", "02 - Semi-Reformado", "03 - Reformado"]
+
+        # Distribui os centros (já ordenados por valor_m2) nos 3 rótulos,
+        # independente de kmeans_n_clusters:
+        #   k=3 -> 1 centro por rótulo
+        #   k=9 -> 3 centros por rótulo (comportamento anterior)
+        n = len(order)
+        mapping = {cid: labels[min(i * 3 // n, 2)] for i, cid in enumerate(order)}
         return scaler, km, mapping
 
-    def _aplicar_cluster_fixo(self, dados: pd.DataFrame, scaler, km, mapping) -> pd.DataFrame:
-        feats = ["valor_m2", "area_util"]
+    def _aplicar_cluster_fixo(self, dados: pd.DataFrame, scaler, km, mapping,
+                              bairro: str = "") -> pd.DataFrame:
+        # Precisa usar exatamente as mesmas features do treino, senão o
+        # scaler/predict recebe shape diferente.
+        feats = self._cluster_feats(bairro)
         dfc   = dados.dropna(subset=feats).copy()
         if dfc.empty:
             return dfc
@@ -394,6 +556,30 @@ class EstudoMercado:
     def _bairro_e_luxo(self, bairro: str) -> bool:
         return bairro.strip().upper() in {b.upper() for b in self.BAIRROS_LUXO}
 
+    def _aplicar_faixa_luxo_lagos(self, dados: pd.DataFrame) -> pd.DataFrame:
+        """
+        LAGO SUL e LAGO NORTE não usam KMeans para luxo: usam faixas fixas de preço.
+          - preco < 2.5M              -> "" (não entra na faixa de luxo)
+          - 2.5M <= preco <= 8M       -> "LUXO"
+          - preco > 8M                -> "ALTO LUXO"
+        """
+        df = dados.copy()
+        if df.empty:
+            df["luxo"] = ""
+            return df
+
+        luxo_min      = self.LUXO_FAIXAS_LAGOS["luxo_min"]
+        alto_luxo_min = self.LUXO_FAIXAS_LAGOS["alto_luxo_min"]
+
+        condicoes = [
+            df["preco"] > alto_luxo_min,
+            df["preco"] >= luxo_min,
+        ]
+        escolhas = ["ALTO LUXO", "LUXO"]
+        df["luxo"] = np.select(condicoes, escolhas, default="")
+        df["luxo"] = df["luxo"].astype("string").fillna("")
+        return df
+
     def _aplicar_cluster_luxo(self, dados: pd.DataFrame) -> pd.DataFrame:
         df = dados.copy()
         if df.empty:
@@ -404,6 +590,13 @@ class EstudoMercado:
             str(df["bairro"].dropna().iloc[0]).strip().upper()
             if "bairro" in df.columns and df["bairro"].notna().any() else ""
         )
+
+        # LAGO SUL / LAGO NORTE: faixas fixas de preço (sem KMeans)
+        if self._bairro_usa_regra_lagos(bairro_ref):
+            return self._aplicar_faixa_luxo_lagos(df)
+
+        # Demais bairros de luxo continuam no KMeans antigo (hoje BAIRROS_LUXO
+        # e BAIRROS_LAGOS coincidem, então este caminho fica inativo)
         if not self._bairro_e_luxo(bairro_ref) or not SKLEARN_OK:
             df["luxo"] = ""
             return df
@@ -482,7 +675,7 @@ class EstudoMercado:
 
         # 2) CLUSTER_VAGA
         if self.clusters_ativos and scaler is not None and km is not None:
-            dfc = self._aplicar_cluster_fixo(base, scaler, km, mapping)
+            dfc = self._aplicar_cluster_fixo(base, scaler, km, mapping, bairro)
             if not dfc.empty:
                 dfc["luxo"] = dfc["luxo"].astype("string").fillna("")
                 c = self._agg_metricas(dfc, ["mes_ref", "vaga_cat", "cluster_nome", "luxo"])
@@ -525,7 +718,22 @@ class EstudoMercado:
             return pd.DataFrame()
 
         out = pd.concat(linhas, ignore_index=True)
-        out = out[out["amostra"] >= self.min_amostra_segmento].copy()
+
+        if self.corte_por_serie:
+            # Corte POR SÉRIE, não por ponto: a combinação é mantida em todos os
+            # mes_ref da janela se atingir min_amostra_segmento em ALGUM mês.
+            # Sem isso, um mês fraco apaga o ponto e quebra a linha do gráfico de
+            # evolução (ex.: ALTO LUXO/Original com amostra 1 e 4 nos meses
+            # anteriores e 7 no mês-alvo aparecia só no mês-alvo).
+            # Os pontos fracos continuam identificáveis pela coluna `amostra`.
+            passa = (
+                out.groupby(self.CHAVE_SERIE, dropna=False)["amostra"]
+                .transform("max") >= self.min_amostra_segmento
+            )
+            out = out[passa].copy()
+        else:
+            out = out[out["amostra"] >= self.min_amostra_segmento].copy()
+
         if out.empty:
             return out
 
@@ -645,7 +853,7 @@ class EstudoMercado:
         scaler = km = mapping = None
         if self.clusters_ativos:
             try:
-                scaler, km, mapping = self._treinar_cluster_global(df_limpo)
+                scaler, km, mapping = self._treinar_cluster_global(df_limpo, bairro)
             except Exception as e:
                 print(f"[WARN] Cluster desativado para {bairro}/{tipo}: {e}")
 
@@ -783,8 +991,8 @@ class EstudoMercado:
         scaler = km = mapping = None
         if self.clusters_ativos and SKLEARN_OK:
             try:
-                scaler, km, mapping = self._treinar_cluster_global(df)
-                df = self._aplicar_cluster_fixo(df, scaler, km, mapping)
+                scaler, km, mapping = self._treinar_cluster_global(df, self.bairro_unico or "")
+                df = self._aplicar_cluster_fixo(df, scaler, km, mapping, self.bairro_unico or "")
             except Exception as e:
                 print(f"[WARN] Não foi possível gerar clusters para o gráfico: {e}")
 
@@ -826,16 +1034,16 @@ dt_3 = dt_3ant.strftime('%Y-%m')
 if __name__ == "__main__":
 
     # --- Individual: um bairro e tipo específicos ---
-    #em = EstudoMercado(bairro="ASA SUL", tipo="CASA")
-    #em.carregar_dados()
-    #em.enviar_banco_individual()
-    #em.gerarResumo()
-    #em.gerarGraficoCluster()
-    #print(em.ver_dados())
+    em = EstudoMercado(bairro="LAGO NORTE", tipo="CASA CONDOMINIO")
+    em.carregar_dados()
+    em.enviar_banco_individual()
+    em.gerarResumo()
+    em.gerarGraficoCluster()
+    print(em.ver_dados())
 
     # --- Lote: todos os bairros e tipos ---
-    em = EstudoMercado()
-    em.enviar_banco()
+    #em = EstudoMercado()
+    #em.enviar_banco()
 
     # --- Só carregar dados, sem gravar ---
     #em = EstudoMercado(bairro="ASA NORTE", tipo="APARTAMENTO")
@@ -844,7 +1052,6 @@ if __name__ == "__main__":
     #somatorio = 0
     #for a in df['valor_m2']:
     #    somatorio += a
-    
+
     #print(somatorio)
     #print(somatorio / len(df["valor_m2"]))
-
