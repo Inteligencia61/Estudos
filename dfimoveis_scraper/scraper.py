@@ -123,6 +123,8 @@ class ScrapeConfig:
     escopo: str
     cidades: list[str] | None
     bairros: list[str] | None
+    retries: int = 3
+    backoff: float = 2.0
 
 
 @dataclass(frozen=True)
@@ -203,12 +205,55 @@ def make_soup(raw: str) -> BeautifulSoup:
     return BeautifulSoup(extract_real_html(raw), "html.parser")
 
 
-def fetch(session: requests.Session, url: str, timeout: int) -> str:
-    response = session.get(url, timeout=timeout)
-    response.raise_for_status()
-    if not response.encoding or response.encoding.lower() == "iso-8859-1":
-        response.encoding = response.apparent_encoding or "utf-8"
-    return response.text
+# Status que valem nova tentativa. 404 fica de fora de proposito: e o sinal de
+# fim de paginacao, nao uma falha.
+STATUS_RETENTAVEIS = {429, 500, 502, 503, 504}
+
+
+def fetch(
+    session: requests.Session,
+    url: str,
+    timeout: int,
+    retries: int = 3,
+    backoff: float = 2.0,
+) -> str:
+    """GET com retry exponencial.
+
+    O portal derruba conexao de vez em quando (read timeout). Sem retry, uma
+    unica falha no meio de uma varredura de horas mata a execucao inteira.
+    """
+    ultimo_erro: Exception | None = None
+
+    for tentativa in range(retries + 1):
+        try:
+            response = session.get(url, timeout=timeout)
+            if response.status_code in STATUS_RETENTAVEIS:
+                raise requests.HTTPError(
+                    f"status {response.status_code}", response=response
+                )
+            response.raise_for_status()
+            if not response.encoding or response.encoding.lower() == "iso-8859-1":
+                response.encoding = response.apparent_encoding or "utf-8"
+            return response.text
+
+        except requests.HTTPError as exc:
+            # 404 sobe na hora: quem chama usa isso para parar o escopo.
+            if exc.response is not None and exc.response.status_code == 404:
+                raise
+            ultimo_erro = exc
+        except requests.RequestException as exc:
+            ultimo_erro = exc
+
+        if tentativa < retries:
+            espera = backoff ** tentativa
+            print(
+                f"  falha ({type(ultimo_erro).__name__}); "
+                f"tentativa {tentativa + 2}/{retries + 1} em {espera:.0f}s",
+                file=sys.stderr,
+            )
+            time.sleep(espera)
+
+    raise ultimo_erro
 
 
 def build_listing_url(oferta: str, pagina: int, scope: ListingScope | None = None) -> str:
@@ -440,6 +485,8 @@ def scrape(
     ofertas = ["venda", "aluguel"] if config.oferta == "ambos" else [config.oferta]
     rows: list[dict[str, str]] = []
     seen_links: set[str] = set()
+    # (oferta, escopo, pagina, erro) — escopos que morreram apos esgotar as tentativas.
+    escopos_com_falha: list[tuple[str, str, int, str]] = []
 
     def add_cards(cards: list[dict[str, str]]) -> bool:
         for row in cards:
@@ -449,7 +496,10 @@ def scrape(
             if config.detalhes and not arquivo_listagem:
                 try:
                     print(f"Baixando detalhe: {row['link']}", file=sys.stderr)
-                    detail = parse_detail(fetch(session, row["link"], config.timeout))
+                    detail = parse_detail(
+                        fetch(session, row["link"], config.timeout,
+                              config.retries, config.backoff)
+                    )
                     row.update(detail)
                     time.sleep(config.delay)
                 except requests.RequestException as exc:
@@ -477,12 +527,20 @@ def scrape(
                 url = build_listing_url(oferta, pagina, scope)
                 print(f"Baixando listagem: {url}", file=sys.stderr)
                 try:
-                    raw = fetch(session, url, config.timeout)
+                    raw = fetch(session, url, config.timeout, config.retries, config.backoff)
                 except requests.HTTPError as exc:
                     if exc.response is not None and exc.response.status_code == 404:
                         print(f"Parando {oferta}/{scope.label}: pagina {pagina} retornou 404.", file=sys.stderr)
                         break
-                    raise
+                    escopos_com_falha.append((oferta, scope.label, pagina, str(exc)))
+                    print(f"FALHA {oferta}/{scope.label} pagina {pagina}: {exc}. Pulando escopo.", file=sys.stderr)
+                    break
+                except requests.RequestException as exc:
+                    # Ja passou por todas as tentativas do fetch. Perder um escopo e
+                    # melhor do que perder a varredura inteira.
+                    escopos_com_falha.append((oferta, scope.label, pagina, str(exc)))
+                    print(f"FALHA {oferta}/{scope.label} pagina {pagina}: {exc}. Pulando escopo.", file=sys.stderr)
+                    break
                 cards = parse_listing(raw)
                 print(f"{url}: {len(cards)} imoveis encontrados", file=sys.stderr)
                 if not cards:
@@ -492,6 +550,17 @@ def scrape(
                     return rows
                 pagina += 1
                 time.sleep(config.delay)
+
+    if escopos_com_falha:
+        print("", file=sys.stderr)
+        print("=== ESCOPOS INCOMPLETOS ===", file=sys.stderr)
+        for oferta, label, pagina, erro in escopos_com_falha:
+            print(f"  {oferta}/{label}: parou na pagina {pagina} ({erro})", file=sys.stderr)
+        print(
+            f"  {len(escopos_com_falha)} escopo(s) incompleto(s). "
+            f"Rode de novo so eles com --cidades/--bairros e --inicio.",
+            file=sys.stderr,
+        )
 
     return rows
 
@@ -511,6 +580,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fim", type=int, help="Pagina final. Se omitido, continua ate uma pagina sem imoveis.")
     parser.add_argument("--delay", type=float, default=1.0, help="Pausa entre requisicoes, em segundos.")
     parser.add_argument("--timeout", type=int, default=30, help="Timeout HTTP, em segundos.")
+    parser.add_argument("--retries", type=int, default=3,
+                        help="Tentativas extras por requisicao que falhar (timeout, 5xx, 429).")
+    parser.add_argument("--backoff", type=float, default=2.0,
+                        help="Base da espera exponencial entre tentativas, em segundos.")
     parser.add_argument("--saida", help="Arquivo CSV de saida. Se omitido, usa a data da coleta.")
     parser.add_argument("--limite", type=int, help="Numero maximo de imoveis para capturar.")
     parser.add_argument("--sem-detalhes", action="store_true", help="Nao abrir paginas individuais dos imoveis.")
@@ -542,6 +615,8 @@ def main() -> int:
         escopo=args.escopo,
         cidades=parse_csv_arg(args.cidades),
         bairros=parse_csv_arg(args.bairros),
+        retries=args.retries,
+        backoff=args.backoff,
     )
     output_path = Path(args.saida) if args.saida else Path(f"{date.today().isoformat()}.csv")
     rows = scrape(config, args.arquivo_listagem, output_path)
