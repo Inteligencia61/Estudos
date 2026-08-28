@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import closing
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -134,6 +135,22 @@ class EstudoMercado:
         "LAGO NORTE": {"n_clusters": 3, "features": ["valor_m2"]},
     }
 
+    # ----------------------------------------------------------
+    # Qualidade estatística
+    # ----------------------------------------------------------
+    # Faixas de `imoveis_unicos` (imóveis distintos no mês, não linhas de
+    # snapshot) usadas para carimbar cada ponto. O gráfico precisa distinguir
+    # -8% com 6 imóveis de -8% com 180.
+    CONFIABILIDADE_FAIXAS = [(30, "ALTA"), (15, "MEDIA"), (5, "BAIXA")]
+    CONFIABILIDADE_MINIMA = "INSUFICIENTE"
+
+    # Tolerâncias do dedupe físico: o mesmo imóvel anunciado por várias
+    # imobiliárias entra com códigos diferentes e conta N vezes na mediana.
+    # Assinatura = (lat, lon arredondados) + área + quartos + preço arredondado.
+    DEDUPE_CASAS_DECIMAIS = 4        # ~11 m de precisão em lat/lon
+    DEDUPE_AREA_TOL       = 2.0      # m² de arredondamento da área
+    DEDUPE_PRECO_TOL_PCT  = 0.02     # 2% de banda de preço
+
     # Identifica uma "série" dentro de uma janela de mês-alvo: é o conjunto de
     # pontos (um por mes_ref) que forma UMA linha no gráfico de evolução.
     # Tudo menos `mes_ref` e as métricas.
@@ -211,7 +228,20 @@ class EstudoMercado:
         area_max: int = 1_500_000,
         vlm2_min: int = 1_000,
         vlm2_max: int = 900_000,
-        aplicar_iqr: bool = True,
+        # Tratamento de cauda. "winsor" (padrão) trunca em p1/p99 e PRESERVA a
+        # linha; o IQR global antigo DELETAVA o topo do bairro inteiro — no
+        # LAGO SUL isso descartava justamente o ALTO LUXO, o segmento que o
+        # estudo mais precisa. Opções: "winsor" | "iqr_grupo" | "iqr" | "none".
+        metodo_outlier: str = "winsor",
+        winsor_p: float = 0.01,
+        aplicar_iqr: Optional[bool] = None,   # legado: False => metodo_outlier="none"
+        # Um imóvel anunciado por 5 imobiliárias vira 5 códigos e pesa 5x.
+        dedupe_fisico: bool = True,
+        # Snapshot é semanal: sem colapsar, um anúncio parado 12 semanas pesa
+        # 12x mais que um que vendeu em 1 — exatamente o viés inverso do que o
+        # estudo quer (imóvel encalhado é o caro). Colapsa para 1 linha por
+        # código/mês, ficando com o último snapshot do mês.
+        colapsar_por_listagem: bool = True,
         # cluster
         clusters_ativos: bool = True,
         # Fallback: usado nos bairros sem entrada em CLUSTER_CONFIG.
@@ -225,6 +255,11 @@ class EstudoMercado:
         tbl_metricas: str = "estudo_metricas",
         upsert_page_size: int = 2000,
         min_amostra_segmento: int = 5,
+        # O scraper cobre ~50 bairros; BAIRROS lista 12. Com auto_escopo o
+        # lote pergunta ao banco quais pares bairro/tipo tem volume suficiente
+        # e roda todos, em vez de ignorar o que ja foi coletado.
+        auto_escopo: bool = True,
+        min_linhas_escopo: int = 300,
         # True  = corte por série (mantém a linha do gráfico de evolução)
         # False = corte por ponto (comportamento anterior)
         corte_por_serie: bool = True,
@@ -249,7 +284,20 @@ class EstudoMercado:
         self.area_max    = area_max
         self.vlm2_min    = vlm2_min
         self.vlm2_max    = vlm2_max
-        self.aplicar_iqr = aplicar_iqr
+
+        metodo = str(metodo_outlier or "none").strip().lower()
+        if aplicar_iqr is False:
+            metodo = "none"
+        elif aplicar_iqr is True and metodo_outlier == "winsor":
+            # chamada legada explícita `aplicar_iqr=True` mantém o IQR antigo
+            metodo = "iqr"
+        if metodo not in {"winsor", "iqr_grupo", "iqr", "none"}:
+            raise ValueError(f"metodo_outlier inválido: {metodo_outlier}")
+        self.metodo_outlier = metodo
+        self.winsor_p       = float(winsor_p)
+        self.aplicar_iqr    = metodo in {"iqr", "iqr_grupo"}
+        self.dedupe_fisico         = bool(dedupe_fisico)
+        self.colapsar_por_listagem = bool(colapsar_por_listagem)
 
         # cluster
         self.clusters_ativos          = clusters_ativos
@@ -265,6 +313,8 @@ class EstudoMercado:
         self.upsert_page_size  = upsert_page_size
         self.min_amostra_segmento = min_amostra_segmento
         self.corte_por_serie      = corte_por_serie
+        self.auto_escopo          = bool(auto_escopo)
+        self.min_linhas_escopo    = int(min_linhas_escopo)
 
         # estado interno
         self.df_analisado: Optional[pd.DataFrame] = None   # dados brutos carregados
@@ -283,12 +333,23 @@ class EstudoMercado:
         return meses
 
     def _pg_connect(self):
+        """
+        Conexão lida exclusivamente do ambiente (.env / variáveis de sessão).
+        Sem fallback embutido: credencial em código vaza no histórico do git.
+        """
+        faltando = [k for k in ("PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD")
+                    if not os.getenv(k)]
+        if faltando:
+            raise RuntimeError(
+                "Variáveis de ambiente ausentes: " + ", ".join(faltando) +
+                ". Defina-as no .env (não versionado) antes de rodar o pipeline."
+            )
         return psycopg2.connect(
-            host=os.getenv("PGHOST", "db-restore.ctug6oqcsj14.us-east-2.rds.amazonaws.com"),
+            host=os.getenv("PGHOST"),
             port=int(os.getenv("PGPORT", "5432")),
-            dbname=os.getenv("PGDATABASE", "coleta_imobiliaria"),
-            user=os.getenv("PGUSER", "inteligencia"),
-            password=os.getenv("PGPASSWORD", "61imoveis"),
+            dbname=os.getenv("PGDATABASE"),
+            user=os.getenv("PGUSER"),
+            password=os.getenv("PGPASSWORD"),
         )
 
     def _ensure_schema_and_table(self, conn) -> None:
@@ -315,11 +376,18 @@ class EstudoMercado:
           quadra         text not null default '',
           luxo           text not null default '',
           amostra        int not null,
+          imoveis_unicos int,
           m2_medio       double precision,
           m2_mediana     double precision,
+          m2_p25         double precision,
+          m2_p75         double precision,
+          m2_desvio      double precision,
           preco_mediana  double precision,
           area_mediana   double precision,
           variacao_m2_pct double precision,
+          variacao_repeat_pct double precision,
+          n_repeat       int,
+          confiabilidade text,
           gerado_em      timestamp not null default now(),
           primary key (
             bairro, tipo, oferta,
@@ -344,6 +412,21 @@ class EstudoMercado:
                 add column if not exists luxo text not null default '';
                 alter table {schema}.{tbl}
                 add column if not exists variacao_m2_pct double precision;
+                -- Colunas de qualidade estatística e índice constant-quality.
+                alter table {schema}.{tbl}
+                add column if not exists imoveis_unicos int;
+                alter table {schema}.{tbl}
+                add column if not exists m2_p25 double precision;
+                alter table {schema}.{tbl}
+                add column if not exists m2_p75 double precision;
+                alter table {schema}.{tbl}
+                add column if not exists m2_desvio double precision;
+                alter table {schema}.{tbl}
+                add column if not exists variacao_repeat_pct double precision;
+                alter table {schema}.{tbl}
+                add column if not exists n_repeat int;
+                alter table {schema}.{tbl}
+                add column if not exists confiabilidade text;
             """)
 
     # ----------------------------------------------------------
@@ -351,7 +434,7 @@ class EstudoMercado:
     # ----------------------------------------------------------
 
     def _carregar_do_banco(self, bairro: str, tipo: str,
-                           inicio: date, fim: date) -> pd.DataFrame:
+                           inicio: date, fim: date, conn=None) -> pd.DataFrame:
         oferta_alvo   = self.oferta
         ofertas_aceitas = list({oferta_alvo, "PUBLICADO"})
 
@@ -383,14 +466,24 @@ class EstudoMercado:
             ORDER BY codigo, data_coleta, data_coleta DESC;
         """).format(tabela=psql.Identifier(self.tabela_fonte))
 
-        with self._pg_connect() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(q, (
-                    inicio, fim, bairro, tipo, ofertas_aceitas,
-                    self.preco_min, self.preco_max,
-                    self.area_min,  self.area_max,
-                ))
-                rows = cur.fetchall()
+        params = (
+            inicio, fim, bairro, tipo, ofertas_aceitas,
+            self.preco_min, self.preco_max,
+            self.area_min,  self.area_max,
+        )
+
+        def _fetch(c):
+            with c.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(q, params)
+                return cur.fetchall()
+
+        if conn is not None:
+            rows = _fetch(conn)
+        else:
+            # `with psycopg2.connect()` fecha a transacao, NAO a conexao: o
+            # lote antigo abria uma conexao por consulta e nunca as devolvia.
+            with closing(self._pg_connect()) as c:
+                rows = _fetch(c)
 
         df = pd.DataFrame(rows)
         if df.empty:
@@ -419,6 +512,123 @@ class EstudoMercado:
             return df
         return df[(df[coluna] >= q1 - 1.5 * iqr) & (df[coluna] <= q3 + 1.5 * iqr)].copy()
 
+    def _winsorizar(self, df: pd.DataFrame, coluna: str) -> pd.DataFrame:
+        """
+        Trunca a coluna nos percentis p / 1-p em vez de remover as linhas.
+        Diferenca pratica para o IQR: o imovel de R$ 40M continua no estudo
+        (entra na contagem, no segmento e no cluster), so nao arrasta a media.
+        """
+        s = df[coluna].dropna()
+        if s.empty or len(s) < 20:
+            return df
+        lo, hi = s.quantile(self.winsor_p), s.quantile(1 - self.winsor_p)
+        if pd.isna(lo) or pd.isna(hi) or lo >= hi:
+            return df
+        out = df.copy()
+        out[coluna] = out[coluna].clip(lower=lo, upper=hi)
+        return out
+
+    def _tratar_cauda(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Aplica o metodo de cauda configurado em `metodo_outlier`.
+
+        "iqr_grupo" roda o IQR DENTRO de cada faixa de metragem em vez de sobre
+        o bairro inteiro: um sobrado de 900 m2 deixa de ser outlier por ser
+        grande e so e cortado se for caro para o proprio tamanho.
+        """
+        metodo = self.metodo_outlier
+        if metodo == "none" or df.empty:
+            return df
+        if metodo == "winsor":
+            return self._winsorizar(df, "valor_m2")
+        if metodo == "iqr":
+            return self._remover_outliers_iqr(df, "valor_m2") if len(df) >= 20 else df
+        # iqr_grupo
+        if "metragem_fx" not in df.columns:
+            return self._remover_outliers_iqr(df, "valor_m2") if len(df) >= 20 else df
+        partes = []
+        for _, grupo in df.groupby("metragem_fx", dropna=False):
+            partes.append(self._remover_outliers_iqr(grupo, "valor_m2")
+                          if len(grupo) >= 20 else grupo)
+        return pd.concat(partes, ignore_index=False) if partes else df
+
+    def _dedupe_fisico(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Remove o mesmo imovel anunciado por imobiliarias diferentes.
+
+        `DISTINCT ON (codigo, data_coleta)` na consulta so resolve repeticao do
+        MESMO anuncio. O caso real e outro: um imovel na carteira de 5
+        imobiliarias entra com 5 codigos distintos e pesa 5x na mediana. Como
+        anuncio muito compartilhado se concentra em lancamento e alto padrao,
+        o vies e sistematico, nao ruido.
+
+        Assinatura por data de coleta: lat/lon arredondados + area + quartos +
+        preco em banda de 2%. Sobrevive o registro de menor preco (o anuncio
+        que o comprador de fato encontra primeiro).
+        """
+        if df.empty or not self.dedupe_fisico:
+            return df
+        if not {"latitude", "longitude"}.issubset(df.columns):
+            return df
+
+        d = df.copy()
+        casas = self.DEDUPE_CASAS_DECIMAIS
+        tol = self.DEDUPE_AREA_TOL
+
+        lat = pd.to_numeric(d["latitude"], errors="coerce").round(casas)
+        lon = pd.to_numeric(d["longitude"], errors="coerce").round(casas)
+        # Sem geo nao da para afirmar que e o mesmo imovel: linha passa intacta.
+        tem_geo = lat.notna() & lon.notna()
+
+        area_b = (pd.to_numeric(d["area_util"], errors="coerce") / tol).round() * tol
+        preco_log = np.log(pd.to_numeric(d["preco"], errors="coerce").clip(lower=1))
+        preco_b = (preco_log / self.DEDUPE_PRECO_TOL_PCT).round()
+        quartos = pd.to_numeric(d.get("quartos"), errors="coerce").fillna(-1)
+
+        d["_sig"] = (
+            d["data_coleta"].astype("string") + "|" + lat.astype("string") + "|"
+            + lon.astype("string") + "|" + area_b.astype("string") + "|"
+            + quartos.astype("string") + "|" + preco_b.astype("string")
+        )
+        d.loc[~tem_geo, "_sig"] = pd.NA
+
+        com_geo = d[d["_sig"].notna()].sort_values("preco")
+        com_geo = com_geo.drop_duplicates(subset=["_sig"], keep="first")
+        sem_geo = d[d["_sig"].isna()]
+
+        out = pd.concat([com_geo, sem_geo], ignore_index=True).drop(columns=["_sig"])
+        removidas = len(df) - len(out)
+        if removidas:
+            print(f"[INFO] dedupe fisico: -{removidas} linhas "
+                  f"({removidas / len(df):.1%} eram o mesmo imovel "
+                  f"em anuncios diferentes)")
+        return out
+
+    def _colapsar_por_listagem(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Uma linha por (codigo, mes): o ultimo snapshot do mes.
+
+        A coleta e semanal, entao sem isso um anuncio que fica 12 semanas no ar
+        entra 12 vezes na mediana e um que sai em 1 semana entra 1 vez. Como
+        anuncio encalhado costuma ser o caro, a mediana bruta puxa para cima o
+        preco pedido. Depois deste colapso, `amostra` passa a significar
+        "imoveis no mes", que e o que o estudo le.
+        """
+        if df.empty or not self.colapsar_por_listagem:
+            return df
+        if not {"codigo", "mes_ref"}.issubset(df.columns):
+            return df
+        antes = len(df)
+        out = (
+            df.sort_values("data_dt")
+              .groupby(["codigo", "mes_ref"], dropna=False, as_index=False)
+              .tail(1)
+              .reset_index(drop=True)
+        )
+        print(f"[INFO] colapso por listagem: {antes} snapshots -> "
+              f"{len(out)} imoveis-mes")
+        return out
+
     def _bairro_usa_regra_lagos(self, bairro: str) -> bool:
         return str(bairro).strip().upper() in {b.upper() for b in self.BAIRROS_LAGOS}
 
@@ -446,18 +656,23 @@ class EstudoMercado:
         return ""
 
     def _limpar_dados(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Ordem importa: dedupe e colapso ANTES do tratamento de cauda, para os
+        percentis sairem de imoveis distintos e nao da contagem inflada de
+        snapshots repetidos.
+        """
         df = df.copy().dropna(subset=["preco", "area_util"])
         df["valor_m2"] = df["preco"] / df["area_util"]
         df = df[(df["valor_m2"] >= self.vlm2_min) & (df["valor_m2"] <= self.vlm2_max)]
-
-        if self.aplicar_iqr and len(df) >= 20:
-            df = self._remover_outliers_iqr(df, "valor_m2")
 
         df["quartos"]  = pd.to_numeric(df["quartos"], errors="coerce").fillna(0).astype(int)
         df["vagas"]    = pd.to_numeric(df["vagas"],   errors="coerce").fillna(0).astype(int)
         df["data_dt"]  = pd.to_datetime(df["data_coleta"], errors="coerce")
         df["mes_ref"]  = df["data_dt"].dt.to_period("M").astype("string")
         df["vaga_cat"] = np.where(df["vagas"] > 0, "COM VAGA", "SEM VAGA")
+
+        df = self._dedupe_fisico(df)
+        df = self._colapsar_por_listagem(df)
 
         df["metragem_fx"] = pd.cut(
             df["area_util"],
@@ -483,6 +698,9 @@ class EstudoMercado:
                     .astype("string")
                     .fillna("")
                 )
+
+        # Cauda tratada por ultimo: os percentis ja saem da base deduplicada.
+        df = self._tratar_cauda(df)
 
         df["luxo"] = ""
         return df
@@ -628,18 +846,107 @@ class EstudoMercado:
     # ----------------------------------------------------------
 
     def _agg_metricas(self, df: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
+        """
+        Alem da mediana, devolve dispersao (p25/p75/desvio) e o numero de
+        imoveis distintos. Sem isso o grafico desenha -8% com 6 imoveis do
+        mesmo jeito que -8% com 180, e quem le o estudo nao tem como saber
+        em qual dos dois pode confiar.
+        """
         if df.empty:
             return pd.DataFrame()
-        return (
-            df.groupby(group_cols, dropna=False)
-            .agg(
-                amostra      =("valor_m2", "size"),
-                m2_medio     =("valor_m2", "mean"),
-                m2_mediana   =("valor_m2", "median"),
-                preco_mediana=("preco",    "median"),
-                area_mediana =("area_util","median"),
-            )
-            .reset_index()
+
+        aggs = dict(
+            amostra      =("valor_m2", "size"),
+            m2_medio     =("valor_m2", "mean"),
+            m2_mediana   =("valor_m2", "median"),
+            m2_p25       =("valor_m2", lambda x: x.quantile(0.25)),
+            m2_p75       =("valor_m2", lambda x: x.quantile(0.75)),
+            m2_desvio    =("valor_m2", "std"),
+            preco_mediana=("preco",    "median"),
+            area_mediana =("area_util","median"),
+        )
+        if "codigo" in df.columns:
+            aggs["imoveis_unicos"] = ("codigo", "nunique")
+
+        out = df.groupby(group_cols, dropna=False).agg(**aggs).reset_index()
+        if "imoveis_unicos" not in out.columns:
+            out["imoveis_unicos"] = out["amostra"]
+        return out
+
+    def _agg_repeat(self, df: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
+        """
+        Indice constant-quality (repeat-listing).
+
+        `variacao_m2_pct` compara a mediana de um mes com a do mes seguinte e
+        por isso mistura preco com composicao: um mes com mais imoveis de 4
+        quartos sobe a mediana sem que preco nenhum tenha mudado. Aqui a
+        variacao e medida DENTRO do mesmo codigo, de um mes para o mes
+        seguinte, e so depois agregada (mediana das variacoes individuais).
+        O mix sai da conta.
+
+        So entram pares de meses consecutivos: anuncio que some e volta tres
+        meses depois nao vira variacao mensal.
+        """
+        if df.empty or "codigo" not in df.columns or "mes_ref" not in df.columns:
+            return pd.DataFrame()
+
+        chave = [c for c in group_cols if c != "mes_ref"]
+        cols = list(dict.fromkeys(chave + ["codigo", "mes_ref", "valor_m2"]))
+        painel = df[cols].dropna(subset=["valor_m2", "mes_ref"]).copy()
+        if painel.empty:
+            return pd.DataFrame()
+
+        # Um valor por codigo/mes (redundante se colapsar_por_listagem=True).
+        painel = (
+            painel.groupby(chave + ["codigo", "mes_ref"], dropna=False, as_index=False)
+                  ["valor_m2"].median()
+        )
+
+        mes_dt = pd.to_datetime(painel["mes_ref"].astype(str) + "-01", errors="coerce")
+        painel["_mes_idx"] = mes_dt.dt.year * 12 + mes_dt.dt.month
+        painel = painel.dropna(subset=["_mes_idx"]).sort_values(chave + ["codigo", "_mes_idx"])
+
+        g = painel.groupby(chave + ["codigo"], dropna=False)
+        painel["_ant"] = g["valor_m2"].shift(1)
+        painel["_gap"] = painel["_mes_idx"] - g["_mes_idx"].shift(1)
+
+        pares = painel[(painel["_gap"] == 1) & (painel["_ant"] > 0)].copy()
+        if pares.empty:
+            return pd.DataFrame()
+        pares["_var"] = (pares["valor_m2"] / pares["_ant"] - 1.0) * 100.0
+
+        out = (
+            pares.groupby(chave + ["mes_ref"], dropna=False)
+                 .agg(variacao_repeat_pct=("_var", "median"),
+                      n_repeat=("_var", "size"))
+                 .reset_index()
+        )
+        out["variacao_repeat_pct"] = out["variacao_repeat_pct"].round(2)
+        return out
+
+    def _agg_completo(self, df: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
+        """Metricas do segmento + indice repeat-listing do mesmo recorte."""
+        base = self._agg_metricas(df, group_cols)
+        if base.empty:
+            return base
+        rep = self._agg_repeat(df, group_cols)
+        if rep.empty:
+            base["variacao_repeat_pct"] = np.nan
+            base["n_repeat"] = 0
+            return base
+        chaves = [c for c in group_cols if c in rep.columns]
+        out = base.merge(rep, on=chaves, how="left")
+        out["n_repeat"] = out["n_repeat"].fillna(0).astype(int)
+        return out
+
+    def _classificar_confianca(self, n: pd.Series) -> pd.Series:
+        """Carimbo legivel de tamanho de amostra, para filtro no BI."""
+        n = pd.to_numeric(n, errors="coerce").fillna(0)
+        cond = [n >= corte for corte, _ in self.CONFIABILIDADE_FAIXAS]
+        escolhas = [rotulo for _, rotulo in self.CONFIABILIDADE_FAIXAS]
+        return pd.Series(
+            np.select(cond, escolhas, default=self.CONFIABILIDADE_MINIMA),
+            index=n.index, dtype="object",
         )
 
     def _build_metricas_long(
@@ -666,7 +973,7 @@ class EstudoMercado:
         linhas = []
 
         # 1) GERAL_VAGA
-        g = self._agg_metricas(base, ["mes_ref", "vaga_cat", "luxo"])
+        g = self._agg_completo(base, ["mes_ref", "vaga_cat", "luxo"])
         if not g.empty:
             g["segmento"] = "GERAL_VAGA"
             g["cluster_nome"] = g["metragem_fx"] = g["quadra"] = ""
@@ -678,7 +985,7 @@ class EstudoMercado:
             dfc = self._aplicar_cluster_fixo(base, scaler, km, mapping, bairro)
             if not dfc.empty:
                 dfc["luxo"] = dfc["luxo"].astype("string").fillna("")
-                c = self._agg_metricas(dfc, ["mes_ref", "vaga_cat", "cluster_nome", "luxo"])
+                c = self._agg_completo(dfc, ["mes_ref", "vaga_cat", "cluster_nome", "luxo"])
                 if not c.empty:
                     c["segmento"] = "CLUSTER_VAGA"
                     c["metragem_fx"] = c["quadra"] = ""
@@ -688,7 +995,7 @@ class EstudoMercado:
         # 3) QUARTOS_VAGA
         qbase = base[base["quartos"] > 0].copy()
         if not qbase.empty:
-            q = self._agg_metricas(qbase, ["mes_ref", "vaga_cat", "quartos", "luxo"])
+            q = self._agg_completo(qbase, ["mes_ref", "vaga_cat", "quartos", "luxo"])
             if not q.empty:
                 q["segmento"] = "QUARTOS_VAGA"
                 q["cluster_nome"] = q["metragem_fx"] = q["quadra"] = ""
@@ -697,7 +1004,7 @@ class EstudoMercado:
         # 4) METRAGEM_VAGA
         mbase = base[base["metragem_fx"].astype(str).str.len() > 0].copy()
         if not mbase.empty:
-            m = self._agg_metricas(mbase, ["mes_ref", "vaga_cat", "metragem_fx", "luxo"])
+            m = self._agg_completo(mbase, ["mes_ref", "vaga_cat", "metragem_fx", "luxo"])
             if not m.empty:
                 m["segmento"] = "METRAGEM_VAGA"
                 m["cluster_nome"] = m["quadra"] = ""
@@ -707,7 +1014,7 @@ class EstudoMercado:
         # 5) QUADRA_VAGA
         qd = base[base["quadra"].astype(str).str.len() > 0].copy()
         if not qd.empty:
-            qq = self._agg_metricas(qd, ["mes_ref", "vaga_cat", "quadra", "luxo"])
+            qq = self._agg_completo(qd, ["mes_ref", "vaga_cat", "quadra", "luxo"])
             if not qq.empty:
                 qq["segmento"] = "QUADRA_VAGA"
                 qq["cluster_nome"] = qq["metragem_fx"] = ""
@@ -748,6 +1055,14 @@ class EstudoMercado:
             out[col] = out.get(col, "").astype("string").fillna("")
         out["quartos"] = pd.to_numeric(out.get("quartos", -1), errors="coerce").fillna(-1).astype(int)
 
+        if "imoveis_unicos" not in out.columns:
+            out["imoveis_unicos"] = out["amostra"]
+        for col, default in (("variacao_repeat_pct", np.nan), ("n_repeat", 0)):
+            if col not in out.columns:
+                out[col] = default
+        out["n_repeat"] = pd.to_numeric(out["n_repeat"], errors="coerce").fillna(0).astype(int)
+        out["confiabilidade"] = self._classificar_confianca(out["imoveis_unicos"])
+
         out = self._add_variacao_mensal(out)
 
         return out[[
@@ -755,8 +1070,10 @@ class EstudoMercado:
             "mes_alvo", "janela_inicio", "janela_fim",
             "mes_ref", "segmento",
             "vaga_cat", "cluster_nome", "quartos", "metragem_fx", "quadra", "luxo",
-            "amostra", "m2_medio", "m2_mediana", "preco_mediana", "area_mediana",
-            "variacao_m2_pct",
+            "amostra", "imoveis_unicos",
+            "m2_medio", "m2_mediana", "m2_p25", "m2_p75", "m2_desvio",
+            "preco_mediana", "area_mediana",
+            "variacao_m2_pct", "variacao_repeat_pct", "n_repeat", "confiabilidade",
         ]]
 
     def _add_variacao_mensal(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -791,35 +1108,43 @@ class EstudoMercado:
 
         # Remove linhas existentes para o escopo sendo reprocessado antes de inserir,
         # evitando dependência de constraint específico no ON CONFLICT.
-        combos = df_long[["bairro", "tipo", "oferta", "mes_alvo"]].drop_duplicates()
+        # Um DELETE só para todos os combos: o loop com uma ida ao banco por
+        # combo dominava o tempo de reprocessamento do histórico.
+        combos = [
+            tuple(r) for r in
+            df_long[["bairro", "tipo", "oferta", "mes_alvo"]]
+            .drop_duplicates().itertuples(index=False, name=None)
+        ]
         del_q = psql.SQL(
             "delete from {schema}.{tbl} "
-            "where bairro = %s and tipo = %s and oferta = %s and mes_alvo = %s"
+            "where (bairro, tipo, oferta, mes_alvo) in %s"
         ).format(schema=psql.Identifier(schema), tbl=psql.Identifier(tbl))
         with conn.cursor() as cur:
-            for _, row in combos.iterrows():
-                cur.execute(del_q, (row["bairro"], row["tipo"], row["oferta"], row["mes_alvo"]))
+            cur.execute(del_q, (tuple(combos),))
 
         cols = [
             "bairro", "tipo", "oferta",
             "mes_alvo", "janela_inicio", "janela_fim",
             "mes_ref", "segmento",
             "vaga_cat", "cluster_nome", "quartos", "metragem_fx", "quadra", "luxo",
-            "amostra", "m2_medio", "m2_mediana", "preco_mediana", "area_mediana",
-            "variacao_m2_pct",
+            "amostra", "imoveis_unicos",
+            "m2_medio", "m2_mediana", "m2_p25", "m2_p75", "m2_desvio",
+            "preco_mediana", "area_mediana",
+            "variacao_m2_pct", "variacao_repeat_pct", "n_repeat", "confiabilidade",
         ]
-        payload = [
-            tuple(r[c] if pd.notna(r[c]) else None for c in cols)
-            for _, r in df_long.iterrows()
-        ]
+        bloco = df_long[cols].astype(object)
+        bloco = bloco.where(bloco.notna(), None)
+        payload = list(bloco.itertuples(index=False, name=None))
         q = psql.SQL("""
             insert into {schema}.{tbl} (
               bairro, tipo, oferta,
               mes_alvo, janela_inicio, janela_fim,
               mes_ref, segmento,
               vaga_cat, cluster_nome, quartos, metragem_fx, quadra, luxo,
-              amostra, m2_medio, m2_mediana, preco_mediana, area_mediana,
-              variacao_m2_pct
+              amostra, imoveis_unicos,
+              m2_medio, m2_mediana, m2_p25, m2_p75, m2_desvio,
+              preco_mediana, area_mediana,
+              variacao_m2_pct, variacao_repeat_pct, n_repeat, confiabilidade
             ) values %s
         """).format(schema=psql.Identifier(schema), tbl=psql.Identifier(tbl))
 
@@ -831,7 +1156,7 @@ class EstudoMercado:
     # Pipeline interno reutilizável
     # ----------------------------------------------------------
 
-    def _rodar_pipeline(self, bairro: str, tipo: str) -> pd.DataFrame:
+    def _rodar_pipeline(self, bairro: str, tipo: str, conn=None) -> pd.DataFrame:
         """
         Executa o pipeline completo para um bairro+tipo e retorna o df_long.
         Não grava no banco — apenas processa e retorna.
@@ -840,7 +1165,7 @@ class EstudoMercado:
         inicio_global = min(x[1] for x in janelas)
         fim_global    = max(x[2] for x in janelas)
 
-        df_raw = self._carregar_do_banco(bairro, tipo, inicio_global, fim_global)
+        df_raw = self._carregar_do_banco(bairro, tipo, inicio_global, fim_global, conn=conn)
         if df_raw.empty:
             print(f"[INFO] Sem dados: {bairro} / {tipo}")
             return pd.DataFrame()
@@ -877,25 +1202,74 @@ class EstudoMercado:
     # API pública
     # ----------------------------------------------------------
 
+    def _descobrir_escopos(self, conn, oferta: str) -> List[Tuple[str, str]]:
+        """
+        Pergunta ao banco quais pares (bairro, tipo) têm volume para estudo.
+
+        BAIRROS lista 12 nomes fixos enquanto o scraper já coleta ~50 bairros:
+        o dado existia e era descartado. Aqui o escopo passa a acompanhar a
+        coleta sozinho, e bairro novo entra no estudo assim que junta
+        `min_linhas_escopo` linhas na janela.
+        """
+        janelas = [(ym, *_janela_3_meses(ym)) for ym in self.meses_alvo]
+        inicio  = min(x[1] for x in janelas)
+        fim     = max(x[2] for x in janelas)
+        ofertas_aceitas = list({oferta, "PUBLICADO"})
+
+        q = psql.SQL("""
+            SELECT UPPER(TRIM(bairro)) as bairro,
+                   UPPER(TRIM(tipo))   as tipo,
+                   count(*)            as n
+            FROM {tabela}
+            WHERE data_coleta >= %s AND data_coleta <= %s
+              AND UPPER(TRIM(oferta)) = ANY(%s)
+              AND preco is not null AND area_util is not null
+              AND coalesce(TRIM(bairro), '') <> ''
+              AND coalesce(TRIM(tipo), '')   <> ''
+            GROUP BY 1, 2
+            HAVING count(*) >= %s
+            ORDER BY n DESC
+        """).format(tabela=psql.Identifier(self.tabela_fonte))
+
+        with conn.cursor() as cur:
+            cur.execute(q, (inicio, fim, ofertas_aceitas, self.min_linhas_escopo))
+            linhas = cur.fetchall()
+
+        escopos = [(b, t) for b, t, _ in linhas if t in self.TIPOS]
+        print(f"[INFO] {oferta}: {len(escopos)} escopos com >= "
+              f"{self.min_linhas_escopo} linhas na janela.")
+        return escopos
+
     def enviar_banco(self) -> None:
         """
         Envia métricas para TODOS os bairros, tipos e ofertas (VENDA e ALUGUEL).
+
+        Com `auto_escopo=True` (padrão) os pares bairro/tipo vêm do banco;
+        com False, cai na lista fixa BAIRROS x TIPOS.
         """
-        with self._pg_connect() as conn:
+        with closing(self._pg_connect()) as conn:
             self._ensure_schema_and_table(conn)
+            conn.commit()
             for oferta in self.OFERTAS:
                 self.oferta = oferta
                 filtros = self.FILTROS_OFERTA.get(oferta, {})
                 for k, v in filtros.items():
                     setattr(self, k, v)
-                for bairro in self.BAIRROS:
-                    for tipo in self.TIPOS:
-                        df_long = self._rodar_pipeline(bairro, tipo)
-                        if df_long.empty:
-                            continue
-                        self._upsert(conn, df_long)
-                        print(f"[OK] {oferta} / {bairro} / {tipo}: {len(df_long)} linhas gravadas.")
-            conn.commit()
+
+                if self.auto_escopo:
+                    escopos = self._descobrir_escopos(conn, oferta)
+                else:
+                    escopos = [(b, t) for b in self.BAIRROS for t in self.TIPOS]
+
+                for bairro, tipo in escopos:
+                    df_long = self._rodar_pipeline(bairro, tipo, conn=conn)
+                    if df_long.empty:
+                        continue
+                    self._upsert(conn, df_long)
+                    # Commit por escopo: uma queda no meio do lote não descarta
+                    # as horas de processamento já concluídas.
+                    conn.commit()
+                    print(f"[OK] {oferta} / {bairro} / {tipo}: {len(df_long)} linhas gravadas.")
         print("Envio em lote concluído.")
 
     def enviar_banco_individual(self) -> None:
@@ -906,15 +1280,16 @@ class EstudoMercado:
         if not self.bairro_unico or not self.tipo_unico:
             raise ValueError("Informe bairro e tipo no construtor para usar enviar_banco_individual().")
 
-        df_long = self._rodar_pipeline(self.bairro_unico, self.tipo_unico)
-        if df_long.empty:
-            print("Nenhuma métrica gerada.")
-            return
-
-        self.df_bf = df_long
-
-        with self._pg_connect() as conn:
+        with closing(self._pg_connect()) as conn:
             self._ensure_schema_and_table(conn)
+            conn.commit()
+
+            df_long = self._rodar_pipeline(self.bairro_unico, self.tipo_unico, conn=conn)
+            if df_long.empty:
+                print("Nenhuma métrica gerada.")
+                return
+
+            self.df_bf = df_long
             self._upsert(conn, df_long)
             conn.commit()
         print(f"[OK] {self.bairro_unico} / {self.tipo_unico}: {len(df_long)} linhas gravadas.")
@@ -965,9 +1340,14 @@ class EstudoMercado:
             print(f"  Mês-alvo: {mes}  ({len(sub)} linhas)")
             for seg in sub["segmento"].unique():
                 s = sub[sub["segmento"] == seg]
-                print(f"    [{seg}]  amostra={s['amostra'].sum()}  "
+                confiaveis = (s["confiabilidade"].isin(["ALTA", "MEDIA"])).sum()
+                repeat = s["variacao_repeat_pct"].dropna()
+                repeat_txt = f"{repeat.median():+.2f}%" if not repeat.empty else "s/ par"
+                print(f"    [{seg}]  imoveis={s['imoveis_unicos'].sum()}  "
                       f"m2_med={s['m2_mediana'].mean():.0f}  "
-                      f"preco_med={s['preco_mediana'].mean():.0f}")
+                      f"preco_med={s['preco_mediana'].mean():.0f}  "
+                      f"repeat={repeat_txt}  "
+                      f"linhas_confiaveis={confiaveis}/{len(s)}")
         print("=" * 60)
 
     def gerarGraficoCluster(self) -> None:

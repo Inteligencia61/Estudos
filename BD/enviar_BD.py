@@ -4,15 +4,39 @@ import pandas as pd
 import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import execute_values
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST", "db-restore.ctug6oqcsj14.us-east-2.rds.amazonaws.com"),
-    "port": int(os.getenv("DB_PORT", 5432)),
-    "dbname": os.getenv("DB_NAME", "coleta_imobiliaria"),
-    "user": os.getenv("DB_USER", "inteligencia"),
-    "password": os.getenv("DB_PASSWORD", "61imoveis"),
-}
+def _env(*nomes: str, obrigatorio: bool = True, padrao: str = "") -> str:
+    """Primeira variavel de ambiente definida entre `nomes`.
+
+    Aceita DB_* e PG* porque os scripts do repositorio usaram os dois nomes.
+    Sem fallback com credencial: senha em codigo fica no historico do git para
+    sempre, mesmo depois de removida do arquivo.
+    """
+    for nome in nomes:
+        valor = os.getenv(nome)
+        if valor:
+            return valor
+    if obrigatorio:
+        raise RuntimeError(
+            "Variavel de ambiente ausente: " + " ou ".join(nomes) +
+            ". Defina no .env (nao versionado) antes de rodar."
+        )
+    return padrao
+
+
+def db_config() -> dict:
+    """Lido na hora da conexao, nao no import: modulo importavel sem .env."""
+    return {
+        "host": _env("DB_HOST", "PGHOST"),
+        "port": int(_env("DB_PORT", "PGPORT", obrigatorio=False, padrao="5432")),
+        "dbname": _env("DB_NAME", "PGDATABASE"),
+        "user": _env("DB_USER", "PGUSER"),
+        "password": _env("DB_PASSWORD", "PGPASSWORD"),
+    }
 
 TABELA_DESTINO = "imoveis"
 PORTAL = "df"
@@ -209,13 +233,14 @@ def inserir_dataframe(conn, df: pd.DataFrame):
 
 
 def processar_cargas():
-    if not DB_CONFIG["password"]:
+    cfg = db_config()
+    if not cfg["password"]:
         raise ValueError(
             "A variável de ambiente DB_PASSWORD não foi definida. "
             "Defina a senha antes de rodar o script."
         )
 
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = psycopg2.connect(**cfg)
 
     try:
         for carga in CARGAS:
