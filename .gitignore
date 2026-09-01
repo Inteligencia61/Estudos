@@ -19,3 +19,5 @@ __pycache__/
 *.py[cod]
 venv/
 .env
+# Coletas e arquivos de dados (fora do git: nunca vira commit)
+dados/

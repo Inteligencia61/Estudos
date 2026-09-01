@@ -132,14 +132,42 @@ class HistoricoListagens:
         drop table if exists {schema}.{tbl};
         create table {schema}.{tbl} as
         with limites as (
+            -- A referência de "coleta mais recente" tem que sair das MESMAS
+            -- linhas que o estudo usa. Calculada sobre a tabela inteira, uma
+            -- carga malformada (oferta vazia, por exemplo) avança a data sem
+            -- trazer anúncio elegível nenhum — e aí TODO anúncio vira
+            -- "inativo", zerando `ativo` e mandando a base inteira para a
+            -- conta de saídas. Foi o que aconteceu com as cargas de agosto/2026.
             select max(data_coleta)::date as ultima_coleta,
                    (max(data_coleta) - make_interval(months => %(meses)s))::date as inicio
             from {fonte}
+            where preco is not null and preco > 0
+              and area_util is not null and area_util > 0
+              and upper(trim(oferta)) = any(%(ofertas)s)
         ),
         base as (
-            -- um registro por anúncio por coleta (a fonte repete o card)
-            select distinct on (i.codigo, i.oferta, i.data_coleta)
+            -- um registro por anúncio por coleta (a fonte repete o card).
+            --
+            -- A chave é (portal + identificador), nunca `codigo` sozinho: com
+            -- DF Imóveis e Wimóveis na mesma tabela, dois imóveis diferentes
+            -- podem ter o mesmo código de imobiliária, e a vida dos dois
+            -- seria fundida em um anúncio só. O fallback para `link` cobre o
+            -- Wimóveis, cujo código sai de regex e pode vir vazio.
+            --
+            -- O identificador sai do FIM DA URL: `codigo` guarda texto de
+            -- descrição em parte da base (desalinhamento de coluna do
+            -- scraper) e fundiria imóveis sem relação nenhuma.
+            select distinct on (chave_imovel, i.oferta, i.data_coleta)
+                (
+                  upper(trim(coalesce(i.portal, '?'))) || '|' ||
+                  coalesce(
+                    substring(i.link from '([0-9]{{4,}})/?$'),
+                    nullif(trim(i.codigo), ''),
+                    'ROW' || i.id::text
+                  )
+                )::text                         as chave_imovel,
                 trim(i.codigo)::text            as codigo,
+                upper(trim(coalesce(i.portal, '')))::text as portal,
                 upper(trim(i.oferta))::text     as oferta,
                 upper(trim(i.bairro))::text     as bairro,
                 upper(trim(i.cidade))::text     as cidade,
@@ -154,17 +182,16 @@ class HistoricoListagens:
             where i.data_coleta >= l.inicio
               and i.preco is not null and i.preco > 0
               and i.area_util is not null and i.area_util > 0
-              and coalesce(trim(i.codigo), '') <> ''
               and upper(trim(i.oferta)) = any(%(ofertas)s)
-            order by i.codigo, i.oferta, i.data_coleta, i.preco asc
+            order by chave_imovel, i.oferta, i.data_coleta, i.preco asc
         ),
         seq as (
             select b.*,
-                lag(preco) over (partition by codigo, oferta order by data_coleta) as preco_ant
+                lag(preco) over (partition by chave_imovel, oferta order by data_coleta) as preco_ant
             from base b
         ),
         mov as (
-            select codigo, oferta,
+            select chave_imovel, oferta,
                 count(*) filter (
                     where preco_ant is not null and preco < preco_ant * (1 - %(limiar)s)
                 ) as n_reducoes,
@@ -175,7 +202,9 @@ class HistoricoListagens:
         ),
         vida as (
             select
-                codigo, oferta,
+                chave_imovel, oferta,
+                mode() within group (order by codigo)  as codigo,
+                mode() within group (order by portal)  as portal,
                 mode() within group (order by bairro)  as bairro,
                 mode() within group (order by cidade)  as cidade,
                 mode() within group (order by tipo)    as tipo,
@@ -190,10 +219,11 @@ class HistoricoListagens:
                 avg(area_util)                         as area_util,
                 max(quartos)                           as quartos,
                 max(vagas)                             as vagas
-            from base group by codigo, oferta
+            from base group by chave_imovel, oferta
         )
         select
-            v.codigo, v.oferta, v.bairro, v.cidade, v.tipo, v.quadra,
+            v.chave_imovel, v.codigo, v.portal, v.oferta,
+            v.bairro, v.cidade, v.tipo, v.quadra,
             v.primeira_vez, v.ultima_vez, v.n_coletas,
             v.preco_inicial, v.preco_final, v.preco_min, v.preco_max,
             v.area_util, v.quartos, v.vagas,
@@ -212,11 +242,12 @@ class HistoricoListagens:
             l.ultima_coleta                                   as ref_ultima_coleta,
             now()                                             as gerado_em
         from vida v
-        left join mov m on m.codigo = v.codigo and m.oferta = v.oferta
+        left join mov m
+               on m.chave_imovel = v.chave_imovel and m.oferta = v.oferta
         cross join limites l;
 
         create index if not exists {idx_escopo}
-            on {schema}.{tbl} (bairro, tipo, oferta);
+            on {schema}.{tbl} (bairro, tipo, oferta, portal);
         create index if not exists {idx_datas}
             on {schema}.{tbl} (primeira_vez, ultima_vez);
         """).format(
@@ -248,6 +279,11 @@ class HistoricoListagens:
     def construir_mercado(self, conn) -> int:
         """
         Por bairro x tipo x oferta x mês:
+
+            (agregado por PORTAL: o mesmo imóvel anunciado no DF Imóveis
+             e no Wimóveis são dois anúncios, e somar os portais contaria o
+             estoque duas vezes. Comparação entre portais é válida; soma não,
+             enquanto não houver dedupe físico entre eles.)
 
             estoque_ativo   anúncios no ar em algum momento do mês
             entradas        anúncios que apareceram no mês
@@ -282,7 +318,7 @@ class HistoricoListagens:
         ),
         cruz as (
             select m.mes_ref, m.mes_inicio, m.mes_fim,
-                   h.bairro, h.tipo, h.oferta,
+                   h.bairro, h.tipo, h.oferta, h.portal,
                    h.dias_no_ar, h.ativo, h.n_reducoes, h.variacao_preco_pct,
                    h.valor_m2_final,
                    (h.primeira_vez >= m.mes_inicio and h.primeira_vez <= m.mes_fim) as entrou,
@@ -292,9 +328,10 @@ class HistoricoListagens:
             join h
               on h.primeira_vez <= m.mes_fim
              and h.ultima_vez   >= m.mes_inicio
-        )
+        ),
+        metricas as (
         select
-            bairro, tipo, oferta, mes_ref, mes_inicio, mes_fim,
+            bairro, tipo, oferta, portal, mes_ref, mes_inicio, mes_fim,
             count(*)                                          as estoque_ativo,
             count(*) filter (where entrou)                    as entradas,
             count(*) filter (where saiu)                      as saidas,
@@ -312,10 +349,39 @@ class HistoricoListagens:
                    filter (where n_reducoes > 0))::numeric, 2) as desconto_mediano_pct,
             now()                                             as gerado_em
         from cruz
-        group by bairro, tipo, oferta, mes_ref, mes_inicio, mes_fim;
+        group by bairro, tipo, oferta, portal, mes_ref, mes_inicio, mes_fim
+        ),
+        -- Perfil da série, para separar mês de mercado de mês de cobertura.
+        -- A referência é a MEDIANA do estoque da própria série: a média é
+        -- puxada pelo pico que se quer justamente detectar.
+        perfil as (
+            select bairro, tipo, oferta, portal,
+                   count(*) as meses_na_serie,
+                   percentile_cont(0.5) within group (order by estoque_ativo)
+                       as estoque_mediano_serie
+            from metricas
+            group by 1, 2, 3, 4
+        )
+        select m.*,
+            p.meses_na_serie,
+            round(p.estoque_mediano_serie::numeric, 1) as estoque_mediano_serie,
+            -- Cobertura irregular imita mercado aquecido.
+            -- Caso real: NORTE/CASA/VENDA tinha 2 a 7 imóveis em todo mês e
+            -- 113 só em julho/2026 — 107 entradas, 106 saídas, "93,8% de
+            -- absorção". Não era o bairro girando estoque: era o scraper
+            -- passando ali uma única vez. Sem este carimbo, o bairro lidera
+            -- qualquer ranking de velocidade.
+            case
+              when p.meses_na_serie < 3 then 'IRREGULAR'
+              when m.estoque_ativo > 3 * p.estoque_mediano_serie then 'IRREGULAR'
+              when m.estoque_ativo < 0.33 * p.estoque_mediano_serie then 'IRREGULAR'
+              else 'REGULAR'
+            end as cobertura
+        from metricas m
+        join perfil p using (bairro, tipo, oferta, portal);
 
         create index if not exists {idx_escopo}
-            on {schema}.{tbl} (bairro, tipo, oferta, mes_ref);
+            on {schema}.{tbl} (bairro, tipo, oferta, portal, mes_ref);
         """).format(
             schema=psql.Identifier(self.schema),
             tbl=psql.Identifier(self.tbl_mercado),
@@ -344,26 +410,28 @@ class HistoricoListagens:
             self.construir_mercado(conn)
 
     def resumo(self, bairro: str, tipo: str, oferta: str = "VENDA",
-               ultimos: int = 6) -> pd.DataFrame:
+               ultimos: int = 6, portal: str = "DF") -> pd.DataFrame:
         """Série mensal de mercado para um escopo, pronta para gráfico/relatório."""
         q = psql.SQL("""
-            select mes_ref, estoque_ativo, entradas, saidas, absorcao_pct,
+            select mes_ref, portal, cobertura, estoque_ativo, entradas, saidas, absorcao_pct,
                    meses_estoque, dom_mediano, m2_mediana_estoque,
                    pct_com_reducao, desconto_mediano_pct
             from {schema}.{tbl}
-            where bairro = %s and tipo = %s and oferta = %s
+            where bairro = %s and tipo = %s and oferta = %s and portal = %s
             order by mes_ref desc
             limit %s
         """).format(schema=psql.Identifier(self.schema),
                     tbl=psql.Identifier(self.tbl_mercado))
         with closing(conectar()) as conn:
             df = pd.read_sql(q.as_string(conn), conn,
-                             params=(bairro.upper(), tipo.upper(), oferta.upper(), ultimos))
+                             params=(bairro.upper(), tipo.upper(), oferta.upper(),
+                                     portal.upper(), ultimos))
         return df.sort_values("mes_ref")
 
     def ranking_absorcao(self, tipo: str = "CASA", oferta: str = "VENDA",
                          mes_ref: Optional[str] = None,
-                         min_estoque: int = 30) -> pd.DataFrame:
+                         min_estoque: int = 30,
+                         portal: str = "DF") -> pd.DataFrame:
         """
         Bairros ordenados por velocidade de escoamento no mês.
 
@@ -377,18 +445,19 @@ class HistoricoListagens:
                  tbl=psql.Identifier(self.tbl_mercado))
 
         q = psql.SQL("""
-            select bairro, mes_ref, estoque_ativo, saidas, absorcao_pct,
+            select bairro, mes_ref, portal, cobertura, estoque_ativo, saidas, absorcao_pct,
                    meses_estoque, dom_mediano, pct_com_reducao,
                    desconto_mediano_pct, m2_mediana_estoque
             from {schema}.{tbl}
-            where tipo = %s and oferta = %s and estoque_ativo >= %s
+            where tipo = %s and oferta = %s and portal = %s and estoque_ativo >= %s
+              and cobertura = 'REGULAR'
             {filtro_mes}
             order by absorcao_pct desc nulls last
         """).format(schema=psql.Identifier(self.schema),
                     tbl=psql.Identifier(self.tbl_mercado),
                     filtro_mes=filtro_mes)
 
-        params = [tipo.upper(), oferta.upper(), min_estoque]
+        params = [tipo.upper(), oferta.upper(), portal.upper(), min_estoque]
         if mes_ref:
             params.append(mes_ref)
         with closing(conectar()) as conn:

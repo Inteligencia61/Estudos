@@ -4,12 +4,17 @@ Pipeline de estudo mercadológico da 61: lê o painel de anúncios coletados
 (`imoveis`), trata, segmenta e grava métricas em `analytics`.
 
 ```
-dfimoveis_scraper/scraper.py  ->  CSV semanal
-BD/enviar_BD.py               ->  tabela imoveis (painel: código x semana)
-analise/acionador/
-  acionador.py                ->  analytics.estudo_metricas    (preço pedido, por segmento)
-  listagem_historico.py       ->  analytics.listagem_historico  (vida de cada anúncio)
-                                  analytics.mercado_metricas    (DOM, absorção, desconto)
+coleta_semanal.ps1            ->  dados/coletas/<portal>/AAAA-MM-DD.csv
+  scraper/scraperDF.py                (portal df)
+  scraper/scraperWI.py                (portal wi)
+
+fluxo_mensal.py               ->  roda as três etapas abaixo, em ordem
+  BD/ingestao.py              ->  tabela imoveis (painel: anúncio x semana)
+  analise/acionador/
+    acionador.py              ->  analytics.estudo_metricas     (preço pedido por segmento)
+    listagem_historico.py     ->  analytics.listagem_historico   (vida de cada anúncio)
+                                  analytics.mercado_metricas     (DOM, absorção, desconto)
+    diagnostico_portais.py    ->  conferência somente-leitura
 ```
 
 A divisão de responsabilidade é a seguinte: `acionador.py` responde **quanto
@@ -31,6 +36,15 @@ PGUSER=...
 PGPASSWORD=...
 ```
 
+Rotina normal — dois comandos, nenhum arquivo `.py` editado:
+
+```powershell
+.\coleta_semanal.ps1        # toda semana: DF e WI, cada um na sua pasta
+python fluxo_mensal.py       # início do mês: ingestão + estudo + histórico
+```
+
+Etapas avulsas:
+
 ```powershell
 # métricas de preço pedido — lote (todos os escopos com volume)
 python analise/acionador/acionador.py
@@ -43,7 +57,18 @@ python analise/acionador/listagem_historico.py --somente-resumo --resumo "LAGO S
 
 # testes do pipeline (base sintética, não toca no banco)
 python analise/acionador/testes_pipeline.py
+
+# conferência do que está no banco (somente leitura)
+python analise/acionador/diagnostico_portais.py
+
+# ingestão isolada
+python BD/ingestao.py --dry-run
+python BD/ingestao.py --arquivo dados/coletas/wi/2026-09-01.csv --portal wi
 ```
+
+Além de `PG*`, o `.env` aceita `DATA_DIR` — a raiz das coletas (padrão
+`./dados`). É o que permite cada máquina guardar os CSVs onde quiser sem que
+isso vire alteração de código.
 
 Uso programático:
 
@@ -63,8 +88,9 @@ EstudoMercado(auto_escopo=False).enviar_banco()   # lote na lista fixa antiga
 
 ## 2. O que mudou nesta rodada, e por quê
 
-Sete correções de método. Todas mexem no número que sai no estudo, então estão
-listadas com o efeito esperado.
+Dez correções de método. Todas mexem no número que sai no estudo, então estão
+listadas com o efeito esperado. As três últimas (§2.8 a §2.10) vieram de
+medição direta no banco, não de leitura de código.
 
 ### 2.1 Dedupe físico de anúncio
 `dedupe_fisico=True` (padrão)
@@ -160,6 +186,99 @@ volume na janela e roda todos — bairro novo entra sozinho quando junta massa.
   que o psycopg2 não adapta.
 - `commit` por escopo: queda no meio do lote não descarta o que já rodou.
 
+### 2.8 Dois portais na mesma tabela
+
+O Wimóveis entrou na coleta e a tabela `imoveis` passou a receber duas fontes.
+Três coisas quebravam em silêncio, e o diagnóstico rodado no banco em
+**2026-09-01** confirmou cada uma.
+
+**Chave de painel virou `(portal, id do anúncio)`.** `codigo` sozinho não
+serve: é o código da imobiliária, repete entre portais, e — pior — está
+corrompido em parte da base. Medido: `codigo` = `"Piso Frio"` em 1.663 linhas
+de 47 bairros, `"Churrasqueira, Piscina"` em 617, parágrafos inteiros de
+cláusula de fiança em 789. É texto de descrição caindo na coluna errada por
+desalinhamento no scraper.
+
+O identificador passou a sair do **fim da URL** (`link`), que está preenchido
+em 100% das linhas recentes e termina no id do anúncio no portal:
+
+```sql
+upper(trim(coalesce(portal,'?'))) || '|' ||
+coalesce(substring(link from '([0-9]{4,})/?$'), nullif(trim(codigo),''), 'ROW'||id::text)
+```
+
+Efeito medido numa janela de 2 meses: **61.092 imóveis distintos pela chave
+nova contra 55.486 pelo `codigo`** — ou seja, o código estava fundindo cerca de
+5.600 imóveis sem relação nenhuma, cada fusão contaminando mediana, DOM e
+índice repeat.
+
+**`ultima_coleta` passou a respeitar o filtro de elegibilidade.** Era calculada
+sobre a tabela inteira; uma carga malformada avançava a data sem trazer
+nenhum anúncio válido, e aí **todo** anúncio virava "inativo" — a base inteira
+caía na conta de saídas e a absorção ia a 100%. Foi exatamente o que as cargas
+de agosto/2026 provocaram: `ativos = 0`. Depois da correção, a mesma janela
+devolve 51.250 ativos e DOM médio de 39,9 dias.
+
+**`mercado_metricas` passou a agregar por portal.** O mesmo imóvel anunciado
+nos dois portais são dois anúncios; somar contaria o estoque duas vezes.
+Comparar portais é válido, somar não — enquanto não houver dedupe físico
+entre eles.
+
+### 2.9 Ingestão: o nome do arquivo saiu do código
+
+`CARGAS` em `BD/enviar_BD.py` era reescrito toda carga, e essa edição virava
+commit para limpar a cada `git pull`. `BD/ingestao.py` substitui a lista:
+
+- **portal vem da pasta**, `dados/coletas/<portal>/` — acaba o `PORTAL = "df"`
+  fixo que rotularia coleta do Wimóveis como DF Imóveis;
+- **data vem do nome**, `AAAA-MM-DD.csv` — os dois scrapers já nomeiam assim
+  (e escreviam por cima um do outro, porque usavam o mesmo default no mesmo
+  diretório: era isso que obrigava a renomear na mão);
+- **idempotência por hash**: `analytics.cargas` registra arquivo, portal, data
+  e sha256. Rodar duas vezes não duplica;
+- **`dados/` no `.gitignore`**, raiz configurável por `DATA_DIR` no `.env`.
+
+E o contrato do dataframe fica num lugar só, documentado no cabeçalho de
+`ingestao.py`: `portal`, `id_anuncio`, `codigo`, `oferta` (VENDA|ALUGUEL),
+`tipo` (do imóvel), `data_coleta`, mais os numéricos. Qualquer layout de CSV
+entra; só o canônico chega ao banco.
+
+### 2.10 O layout dos scrapers mudou e ninguém avisou o banco
+
+Achado mais caro do diagnóstico. Os scrapers hoje emitem:
+
+```
+tipo        = venda / aluguel / lancamento     <- isto é a OFERTA
+tipo_imovel = apartamento / casa / ...         <- isto é o TIPO
+```
+
+O carregador continuou tratando `tipo` como tipo do imóvel e ignorando
+`tipo_imovel`. O corte é limpo:
+
+| período | estado |
+|---|---|
+| até 2026-08-13 | layout antigo, base saudável |
+| de 2026-08-18 | 162.413 linhas com `oferta` vazia e `tipo` = VENDA/ALUGUEL |
+
+Consequência: **as coletas de 18, 19, 20, 21, 26 e 28 de agosto estão
+invisíveis para o estudo** — o acionador filtra `oferta in (VENDA, ALUGUEL,
+PUBLICADO)` e nenhuma passa. No total, o acionador aproveitava **438.929 de
+846.233 linhas (52%)** dos últimos 90 dias.
+
+`BD/ingestao.py` resolve daqui para frente. O que já está no banco tem duas
+classes, e `BD/corrigir_layout.py` trata as duas (relatório por padrão, grava
+só com `--aplicar`):
+
+| classe | linhas | reparo |
+|---|---|---|
+| A — `oferta` e `tipo` trocados entre si | ~45,6 mil | `--swap`, nada se perde |
+| B — `oferta` vazia, `tipo` = oferta | ~162,4 mil | **recarregar os CSVs**; o `tipo_imovel` nunca chegou ao banco e não há como reconstruí-lo de lá |
+
+Para a classe B, `--recuperar-oferta` é paliativo: salva a oferta e marca
+`tipo` como nulo, devolvendo as linhas ao histórico de DOM/absorção (que não
+filtra tipo) sem inventar um tipo que não existe. O reparo de verdade é
+recarregar aqueles seis CSVs com `BD/ingestao.py`.
+
 ---
 
 ## 3. O que `listagem_historico.py` acrescenta
@@ -181,6 +300,19 @@ sem coleta nova.
 | `pct_com_reducao` | % do estoque que já baixou o preço pelo menos uma vez |
 | `desconto_mediano_pct` | quanto o mercado devolve entre quem baixou |
 | `entradas` / `saidas` | pressão de oferta e escoamento |
+| `cobertura` | REGULAR / IRREGULAR — ver abaixo |
+
+**`cobertura` não é detalhe.** Bairro que o scraper visita esporadicamente
+produz absorção altíssima e DOM baixíssimo sem que nada tenha acontecido no
+mercado. Caso real medido: NORTE/CASA/VENDA tinha 2 a 7 imóveis em todo mês e
+**113 só em julho/2026** — 107 entradas, 106 saídas, "93,8% de absorção,
+DOM de 10 dias". Era o scraper passando ali uma única vez, e o bairro liderava
+o ranking de velocidade.
+
+O carimbo compara o estoque do mês com a **mediana da própria série** (a média
+seria puxada justamente pelo pico): fora da faixa de 0,33× a 3×, ou série com
+menos de 3 meses, vira `IRREGULAR`. `ranking_absorcao()` já filtra só
+`REGULAR`.
 
 `desconto_mediano_pct` e `dom_mediano` são os dois números que sustentam a
 conversa de precificação com proprietário: deixam de ser opinião do corretor e
@@ -196,6 +328,13 @@ acompanhar tendência, não para afirmar volume de vendas em número absoluto.
 
 ## 4. Pendências conhecidas
 
+- **Recarregar as coletas de 18 a 28/08/2026** (162,4 mil linhas, classe B do
+  §2.10). Só isso devolve o tipo do imóvel dessas semanas.
+- **Duplicatas históricas:** 34.785 chaves `(portal, codigo, data_coleta)`
+  repetidas, 98.608 linhas, pior caso 143×. Por isso `BD/ingestao.py` cria
+  índice comum e **não** único — a criação do único falharia. Ver
+  `python BD/ingestao.py --relatorio-duplicatas`.
+- **12,4% das linhas sem latitude** — o dedupe físico (§2.1) não alcança essas.
 - **Cruzamento com `Estoque/`** — é o único dado transacional real do
   repositório e continua fora do estudo. Fecha o gap pedido-vs-realizado e dá
   share da 61 por bairro.

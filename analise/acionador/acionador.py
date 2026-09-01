@@ -438,32 +438,64 @@ class EstudoMercado:
         oferta_alvo   = self.oferta
         ofertas_aceitas = list({oferta_alvo, "PUBLICADO"})
 
+        # O identificador vem do FIM DA URL, nao do `codigo`.
+        #
+        # `codigo` esta corrompido em parte da base: guarda texto de descricao
+        # ("Piso Frio" em 1.663 linhas de 47 bairros, "Churrasqueira, Piscina",
+        # paragrafos inteiros de fianca) por desalinhamento de coluna no
+        # scraper. Usar isso como chave funde imoveis sem nenhuma relacao.
+        #
+        # `link` esta preenchido em 100% das linhas recentes e termina no id do
+        # anuncio no portal, que e estavel entre coletas.
+        # `chave_imovel` = portal + identificador do anúncio.
+        #
+        # `codigo` sozinho não serve mais como chave de painel: é o código da
+        # imobiliária, e com DF Imóveis e Wimóveis na mesma tabela dois imóveis
+        # diferentes podem compartilhá-lo. Sem o portal na chave, o colapso
+        # mensal e o índice repeat fundem imóveis distintos — em silêncio.
+        #
+        # O fallback é `link` (único por anúncio) e depois o id da linha,
+        # porque o `codigo` do Wimóveis sai de um regex na página de detalhe
+        # e pode vir vazio; código vazio agruparia o portal inteiro em uma
+        # linha só.
         q = psql.SQL("""
-            SELECT DISTINCT ON (codigo, data_coleta)
-                TRIM(codigo)::text                      as codigo,
-                UPPER(TRIM(bairro))::text               as bairro,
-                UPPER(TRIM(cidade))::text               as cidade,
-                UPPER(TRIM(tipo))::text                 as tipo,
-                UPPER(TRIM(oferta))::text               as oferta,
-                area_util::double precision             as area_util,
-                preco::double precision                 as preco,
-                quartos::double precision               as quartos,
-                vagas::double precision                 as vagas,
-                latitude::double precision              as latitude,
-                longitude::double precision             as longitude,
-                UPPER(TRIM(quadra))::text               as quadra,
-                data_coleta::date                       as data_coleta
-            FROM {tabela}
-            WHERE data_coleta >= %s
-              AND data_coleta <= %s
-              AND UPPER(TRIM(bairro)) = %s
-              AND UPPER(TRIM(tipo)) = %s
-              AND UPPER(TRIM(oferta)) = ANY(%s)
-              AND preco is not null
-              AND area_util is not null
-              AND preco >= %s AND preco <= %s
-              AND area_util >= %s AND area_util <= %s
-            ORDER BY codigo, data_coleta, data_coleta DESC;
+            SELECT DISTINCT ON (chave_imovel, data_coleta) *
+            FROM (
+                SELECT
+                    TRIM(codigo)::text                      as codigo,
+                    UPPER(TRIM(COALESCE(portal, '')))::text  as portal,
+                    (
+                      UPPER(TRIM(COALESCE(portal, '?'))) || '|' ||
+                      COALESCE(
+                        SUBSTRING(link FROM '([0-9]{{4,}})/?$'),
+                        NULLIF(TRIM(codigo), ''),
+                        'ROW' || id::text
+                      )
+                    )::text                                 as chave_imovel,
+                    UPPER(TRIM(bairro))::text               as bairro,
+                    UPPER(TRIM(cidade))::text               as cidade,
+                    UPPER(TRIM(tipo))::text                 as tipo,
+                    UPPER(TRIM(oferta))::text               as oferta,
+                    area_util::double precision             as area_util,
+                    preco::double precision                 as preco,
+                    quartos::double precision               as quartos,
+                    vagas::double precision                 as vagas,
+                    latitude::double precision              as latitude,
+                    longitude::double precision             as longitude,
+                    UPPER(TRIM(quadra))::text               as quadra,
+                    data_coleta::date                       as data_coleta
+                FROM {tabela}
+                WHERE data_coleta >= %s
+                  AND data_coleta <= %s
+                  AND UPPER(TRIM(bairro)) = %s
+                  AND UPPER(TRIM(tipo)) = %s
+                  AND UPPER(TRIM(oferta)) = ANY(%s)
+                  AND preco is not null
+                  AND area_util is not null
+                  AND preco >= %s AND preco <= %s
+                  AND area_util >= %s AND area_util <= %s
+            ) t
+            ORDER BY chave_imovel, data_coleta, preco ASC;
         """).format(tabela=psql.Identifier(self.tabela_fonte))
 
         params = (
@@ -493,7 +525,8 @@ class EstudoMercado:
         for c in ["preco", "area_util", "quartos", "vagas", "latitude", "longitude"]:
             if c in df.columns:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
-        for c in ["bairro", "cidade", "tipo", "oferta", "quadra", "codigo"]:
+        for c in ["bairro", "cidade", "tipo", "oferta", "quadra", "codigo",
+                  "portal", "chave_imovel"]:
             if c in df.columns:
                 df[c] = df[c].astype("string").str.strip().str.upper()
         return df
@@ -511,6 +544,19 @@ class EstudoMercado:
         if pd.isna(iqr) or iqr == 0:
             return df
         return df[(df[coluna] >= q1 - 1.5 * iqr) & (df[coluna] <= q3 + 1.5 * iqr)].copy()
+
+    @staticmethod
+    def _col_chave(df: pd.DataFrame) -> Optional[str]:
+        """
+        Coluna que identifica o imóvel no painel.
+
+        `chave_imovel` (portal + código) quando vem do banco; `codigo` como
+        fallback para dataframes montados à mão e para os testes.
+        """
+        for c in ("chave_imovel", "codigo"):
+            if c in df.columns:
+                return c
+        return None
 
     def _winsorizar(self, df: pd.DataFrame, coluna: str) -> pd.DataFrame:
         """
@@ -616,12 +662,13 @@ class EstudoMercado:
         """
         if df.empty or not self.colapsar_por_listagem:
             return df
-        if not {"codigo", "mes_ref"}.issubset(df.columns):
+        chave = self._col_chave(df)
+        if chave is None or "mes_ref" not in df.columns:
             return df
         antes = len(df)
         out = (
             df.sort_values("data_dt")
-              .groupby(["codigo", "mes_ref"], dropna=False, as_index=False)
+              .groupby([chave, "mes_ref"], dropna=False, as_index=False)
               .tail(1)
               .reset_index(drop=True)
         )
@@ -865,8 +912,9 @@ class EstudoMercado:
             preco_mediana=("preco",    "median"),
             area_mediana =("area_util","median"),
         )
-        if "codigo" in df.columns:
-            aggs["imoveis_unicos"] = ("codigo", "nunique")
+        chave = self._col_chave(df)
+        if chave is not None:
+            aggs["imoveis_unicos"] = (chave, "nunique")
 
         out = df.groupby(group_cols, dropna=False).agg(**aggs).reset_index()
         if "imoveis_unicos" not in out.columns:
@@ -887,26 +935,27 @@ class EstudoMercado:
         So entram pares de meses consecutivos: anuncio que some e volta tres
         meses depois nao vira variacao mensal.
         """
-        if df.empty or "codigo" not in df.columns or "mes_ref" not in df.columns:
+        col_imovel = self._col_chave(df)
+        if df.empty or col_imovel is None or "mes_ref" not in df.columns:
             return pd.DataFrame()
 
         chave = [c for c in group_cols if c != "mes_ref"]
-        cols = list(dict.fromkeys(chave + ["codigo", "mes_ref", "valor_m2"]))
+        cols = list(dict.fromkeys(chave + [col_imovel, "mes_ref", "valor_m2"]))
         painel = df[cols].dropna(subset=["valor_m2", "mes_ref"]).copy()
         if painel.empty:
             return pd.DataFrame()
 
-        # Um valor por codigo/mes (redundante se colapsar_por_listagem=True).
+        # Um valor por imovel/mes (redundante se colapsar_por_listagem=True).
         painel = (
-            painel.groupby(chave + ["codigo", "mes_ref"], dropna=False, as_index=False)
+            painel.groupby(chave + [col_imovel, "mes_ref"], dropna=False, as_index=False)
                   ["valor_m2"].median()
         )
 
         mes_dt = pd.to_datetime(painel["mes_ref"].astype(str) + "-01", errors="coerce")
         painel["_mes_idx"] = mes_dt.dt.year * 12 + mes_dt.dt.month
-        painel = painel.dropna(subset=["_mes_idx"]).sort_values(chave + ["codigo", "_mes_idx"])
+        painel = painel.dropna(subset=["_mes_idx"]).sort_values(chave + [col_imovel, "_mes_idx"])
 
-        g = painel.groupby(chave + ["codigo"], dropna=False)
+        g = painel.groupby(chave + [col_imovel], dropna=False)
         painel["_ant"] = g["valor_m2"].shift(1)
         painel["_gap"] = painel["_mes_idx"] - g["_mes_idx"].shift(1)
 

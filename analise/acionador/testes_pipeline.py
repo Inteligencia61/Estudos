@@ -150,6 +150,30 @@ def teste_payload_upsert(df_raw):
     print(f"OK  payload do upsert ({len(payload)} tuplas x {len(cols)} colunas)")
 
 
+def teste_templates_sql():
+    """
+    `psql.SQL(...).format()` usa string.Formatter: qualquer `{...}` no template
+    vira placeholder. Um regex como `[0-9]{4,}` explode em
+    `KeyError: '4,'` — só na hora de rodar contra o banco, que é onde não se
+    quer descobrir. Aqui a checagem é estática: todo campo entre chaves tem
+    que ser um nome que o `.format()` daquele arquivo realmente fornece.
+    """
+    import re
+    from string import Formatter
+
+    for arquivo in ("acionador.py", "listagem_historico.py", "diagnostico_portais.py"):
+        caminho = os.path.join(os.path.dirname(os.path.abspath(__file__)), arquivo)
+        fonte = open(caminho, encoding="utf-8").read()
+        for bloco in re.findall(r'psql\.SQL\("""(.*?)"""\)', fonte, re.S):
+            campos = {nome for _, nome, _, _ in Formatter().parse(bloco) if nome}
+            suspeitos = {c for c in campos if not c.isidentifier()}
+            assert not suspeitos, (
+                f"{arquivo}: chave literal não escapada em template SQL: "
+                f"{sorted(suspeitos)} — dobre as chaves (ex.: {{{{4,}}}})"
+            )
+    print("OK  templates SQL (chaves literais escapadas)")
+
+
 if __name__ == "__main__":
     df_raw = _base_sintetica()
     print(f"base sintética: {len(df_raw)} linhas, {df_raw['codigo'].nunique()} códigos\n")
@@ -158,4 +182,5 @@ if __name__ == "__main__":
     teste_indice_repeat(df_raw)
     teste_cauda(df_raw)
     teste_payload_upsert(df_raw)
+    teste_templates_sql()
     print("\nTODOS OS TESTES PASSARAM")
