@@ -224,6 +224,27 @@ nos dois portais são dois anúncios; somar contaria o estoque duas vezes.
 Comparar portais é válido, somar não — enquanto não houver dedupe físico
 entre eles.
 
+### 2.8b Quadras da Asa Norte e Asa Sul agrupadas por centena
+
+`SQN 409` vira `SQN 400`, `SQS 116` vira `SQS 100`. A série da centena é o
+gradiente de valor do Plano Piloto — a 100 fica no Eixinho Oeste, a 400 cola na
+W3 — e quadra a quadra a amostra não sustentava um ponto de gráfico.
+
+O segmento `QUADRA_VAGA` nessas duas regiões era praticamente inútil antes:
+
+| | antes (quadra crua) | depois (centena) |
+|---|---|---|
+| ASA NORTE venda | 171 linhas, 56 grupos — **zero** com confiança ALTA | 13 linhas, maioria ALTA |
+| ASA SUL venda | 136 linhas, 45 grupos — 3 com confiança ALTA | 10 linhas, 8 ALTA |
+
+E o resultado tem leitura urbana direta (agosto/2026, apartamento, com vaga):
+SQN 100 R$ 14.647/m² · SQN 200 R$ 13.982 · SQN 300 R$ 13.714 · SQN 400
+R$ 14.135 com vaga e R$ 11.440 sem — o degrau em direção à W3 aparece no número.
+
+Configurado em `QUADRA_CENTENAS`, com lista de prefixos por bairro: prefixo
+fora da lista (SEPN, SRTVS) ou quadra sem número cai em `""` e sai do segmento,
+igual às faixas dos lagos. Cerca de 15-18% das quadras não trazem número.
+
 ### 2.9 Ingestão: o nome do arquivo saiu do código
 
 `CARGAS` em `BD/enviar_BD.py` era reescrito toda carga, e essa edição virava

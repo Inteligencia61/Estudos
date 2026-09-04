@@ -151,6 +151,32 @@ class EstudoMercado:
     DEDUPE_AREA_TOL       = 2.0      # m² de arredondamento da área
     DEDUPE_PRECO_TOL_PCT  = 0.02     # 2% de banda de preço
 
+    # ----------------------------------------------------------
+    # Agrupamento de quadras por CENTENA (Asa Norte e Asa Sul)
+    # ----------------------------------------------------------
+    # No Plano Piloto a série da centena é o gradiente de valor: a SQN 100 (ao
+    # lado do Eixinho Oeste) e a SQN 400 (colada na W3) são mercados
+    # diferentes, e quadra a quadra a amostra fica pequena demais para
+    # sustentar um ponto de gráfico. Agrupar 102/104/…/116 em "SQN 100" dá
+    # volume sem misturar realidades.
+    #
+    # `prefixos` restringe o que entra: sem a lista, SEPN/SIA/BR e outros
+    # endereços não residenciais virariam grupos próprios. Prefixo fora da
+    # lista, ou quadra sem número, cai em "" e sai do segmento QUADRA_VAGA —
+    # mesmo comportamento das faixas dos lagos.
+    #
+    # Volume medido em 60 dias (residencial): ASA NORTE SQN 100/200/300/400 =
+    # 2.555 / 2.941 / 3.771 / 1.551; ASA SUL SQS = 2.374 / 2.154 / 1.911 /
+    # 2.305. Cerca de 15-18% das quadras não trazem número e continuam fora.
+    QUADRA_CENTENAS: Dict[str, Dict[str, Any]] = {
+        "ASA NORTE": {
+            "prefixos": ["SQN", "CLN", "SHCGN", "SCRN", "SCLRN", "SGAN", "EQN"],
+        },
+        "ASA SUL": {
+            "prefixos": ["SQS", "CLS", "SHIGS", "CRS", "EQS", "SEPS", "SGAS"],
+        },
+    }
+
     # Identifica uma "série" dentro de uma janela de mês-alvo: é o conjunto de
     # pontos (um por mes_ref) que forma UMA linha no gráfico de evolução.
     # Tudo menos `mes_ref` e as métricas.
@@ -702,6 +728,45 @@ class EstudoMercado:
                 return f"{prefixo} - {bloco}"
         return ""
 
+    def _bairro_usa_centenas(self, bairro: str) -> bool:
+        return str(bairro).strip().upper() in {
+            b.upper() for b in self.QUADRA_CENTENAS
+        }
+
+    def _mapear_quadra_centena(self, quadra: Optional[str], bairro: str) -> str:
+        """
+        "SQN 409 BLOCO L" -> "SQN 400";  "SQS 116" -> "SQS 100".
+
+        Quadra com número abaixo de 100 (SHN QUADRA 1, por exemplo) não tem
+        série de centena e volta vazia, em vez de virar um grupo "SHN 000"
+        que não significa nada.
+        """
+        cfg = self.QUADRA_CENTENAS.get(str(bairro).strip().upper())
+        if cfg is None or not quadra:
+            return ""
+
+        m = re.match(r"^([A-Z]+)\s*0*(\d+)", str(quadra).strip().upper())
+        if not m:
+            return ""
+
+        prefixo, numero = m.group(1), int(m.group(2))
+
+        aceitos = cfg.get("prefixos")
+        if aceitos and prefixo not in {p.upper() for p in aceitos}:
+            return ""
+        if numero < 100:
+            return ""
+
+        return f"{prefixo} {numero // 100}00"
+
+    def _mapear_quadra(self, quadra: Optional[str], bairro: str) -> str:
+        """Despacha para a regra do bairro; sem regra, mantém a quadra crua."""
+        if self._bairro_usa_regra_lagos(bairro):
+            return self._mapear_quadra_lagos(quadra, bairro)
+        if self._bairro_usa_centenas(bairro):
+            return self._mapear_quadra_centena(quadra, bairro)
+        return str(quadra or "").strip().upper()
+
     def _limpar_dados(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Ordem importa: dedupe e colapso ANTES do tratamento de cauda, para os
@@ -734,14 +799,17 @@ class EstudoMercado:
             if "quadra" in df.columns else ""
         )
 
-        # LAGO SUL / LAGO NORTE: substitui a quadra bruta pelo agrupamento
-        # QI/QL Início/Meio/Final
+        # Substitui a quadra bruta pelo agrupamento do bairro:
+        #   LAGO SUL / LAGO NORTE -> QI/QL Início, Meio, Final
+        #   ASA NORTE / ASA SUL   -> centena (SQN 100, SQS 400, ...)
+        #   demais bairros        -> quadra crua, como antes
         if "bairro" in df.columns and df["bairro"].notna().any():
             bairro_ref = str(df["bairro"].dropna().iloc[0]).strip().upper()
-            if self._bairro_usa_regra_lagos(bairro_ref):
+            if (self._bairro_usa_regra_lagos(bairro_ref)
+                    or self._bairro_usa_centenas(bairro_ref)):
                 df["quadra"] = (
                     df["quadra"]
-                    .apply(lambda q: self._mapear_quadra_lagos(q, bairro_ref))
+                    .apply(lambda q: self._mapear_quadra(q, bairro_ref))
                     .astype("string")
                     .fillna("")
                 )

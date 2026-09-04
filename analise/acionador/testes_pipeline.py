@@ -150,6 +150,38 @@ def teste_payload_upsert(df_raw):
     print(f"OK  payload do upsert ({len(payload)} tuplas x {len(cols)} colunas)")
 
 
+def teste_agrupamento_quadras():
+    """
+    Cada bairro tem sua regra de quadra e elas não podem se atropelar:
+    lagos viram Início/Meio/Final, Asa Norte e Asa Sul viram centena, e
+    bairro sem regra mantém a quadra crua.
+    """
+    em = EstudoMercado()
+    casos = [
+        ("ASA NORTE", "SQN 409 BLOCO L", "SQN 400"),
+        ("ASA NORTE", "SQN 116", "SQN 100"),
+        ("ASA NORTE", "CLN 215", "CLN 200"),
+        ("ASA NORTE", "SHCGN 703", "SHCGN 700"),
+        # prefixo fora da lista do bairro não vira grupo
+        ("ASA NORTE", "SEPN 515", ""),
+        # sem série de centena
+        ("ASA NORTE", "SHN QUADRA 1", ""),
+        ("ASA NORTE", "", ""),
+        ("ASA SUL", "SQS 116", "SQS 100"),
+        ("ASA SUL", "SQS 403 BLOCO C", "SQS 400"),
+        ("ASA SUL", "SEPS 705/905", "SEPS 700"),
+        ("ASA SUL", "SRTVS CONJUNTO L", ""),
+        # a regra dos lagos continua valendo
+        ("LAGO SUL", "QI 5 CONJUNTO 3", "QI - Início"),
+        # bairro sem regra mantém a quadra crua
+        ("GUARA", "QE 40 CONJUNTO A", "QE 40 CONJUNTO A"),
+    ]
+    for bairro, bruta, esperado in casos:
+        obtido = em._mapear_quadra(bruta, bairro)
+        assert obtido == esperado, f"{bairro} / {bruta!r}: {obtido!r} != {esperado!r}"
+    print(f"OK  agrupamento de quadras ({len(casos)} casos)")
+
+
 def teste_templates_sql():
     """
     `psql.SQL(...).format()` usa string.Formatter: qualquer `{...}` no template
@@ -182,5 +214,6 @@ if __name__ == "__main__":
     teste_indice_repeat(df_raw)
     teste_cauda(df_raw)
     teste_payload_upsert(df_raw)
+    teste_agrupamento_quadras()
     teste_templates_sql()
     print("\nTODOS OS TESTES PASSARAM")
