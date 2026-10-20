@@ -98,8 +98,15 @@ class EstudoMercado:
     OFERTAS = ["VENDA", "ALUGUEL"]
 
     # Filtros de preço/m² por tipo de oferta (aplicados no envio em lote)
+    #
+    # O piso de venda era R$ 500 mil e cortava o mercado de baixo inteiro: medido em
+    # jul-set/2026, 99,5% dos apartamentos do Riacho Fundo II, 88% de Samambaia Sul, 84% de
+    # Taguatinga Norte e 46% dos 1 quarto da Asa Norte ficavam fora — e a mediana desses
+    # segmentos saía 20-45% acima do real (Riacho Fundo II: R$ 5.757/m² no estudo contra
+    # R$ 3.980 nos anúncios). Santa Maria (98% abaixo do piso) nem entrava no estudo.
+    # O piso agora só barra erro de digitação; quem segura lixo é o vlm2_min e a winsorização.
     FILTROS_OFERTA: Dict[str, Dict] = {
-        "VENDA":   {"preco_min": 500_000, "preco_max": 50_000_000, "vlm2_min": 1_000, "vlm2_max": 900_000},
+        "VENDA":   {"preco_min": 60_000,  "preco_max": 50_000_000, "vlm2_min": 1_000, "vlm2_max": 900_000},
         "ALUGUEL": {"preco_min": 500,     "preco_max": 100_000,    "vlm2_min": 5,     "vlm2_max": 5_000},
     }
 
@@ -248,9 +255,9 @@ class EstudoMercado:
         oferta: str = "VENDA",
         meses_alvo: Optional[List[str]] = None,
         # filtros de preço/área
-        preco_min: int = 500_000,
+        preco_min: int = 60_000,      # ver FILTROS_OFERTA: o piso antigo (500 mil) cortava a periferia
         preco_max: int = 50_000_000,
-        area_min: int = 40,
+        area_min: int = 18,           # 40 m² tirava studio e kitnet anunciados como apartamento
         area_max: int = 1_500_000,
         vlm2_min: int = 1_000,
         vlm2_max: int = 900_000,
@@ -778,6 +785,9 @@ class EstudoMercado:
         df = df[(df["valor_m2"] >= self.vlm2_min) & (df["valor_m2"] <= self.vlm2_max)]
 
         df["quartos"]  = pd.to_numeric(df["quartos"], errors="coerce").fillna(0).astype(int)
+        # "33 quartos", "43 quartos": texto do anúncio caído na coluna. Vira desconhecido (0)
+        # e o imóvel continua no GERAL/METRAGEM, só não cria um segmento QUARTOS_VAGA falso.
+        df.loc[df["quartos"] > 12, "quartos"] = 0
         df["vagas"]    = pd.to_numeric(df["vagas"],   errors="coerce").fillna(0).astype(int)
         df["data_dt"]  = pd.to_datetime(df["data_coleta"], errors="coerce")
         df["mes_ref"]  = df["data_dt"].dt.to_period("M").astype("string")

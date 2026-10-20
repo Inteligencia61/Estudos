@@ -47,7 +47,8 @@ Etapas avulsas:
 
 ```powershell
 # métricas de preço pedido — lote (todos os escopos com volume)
-python analise/acionador/acionador.py
+python -c "import sys; sys.path.insert(0, 'analise/acionador'); from acionador import EstudoMercado; EstudoMercado().enviar_banco()"
+# (o __main__ de acionador.py roda só um bairro de exemplo, não o lote)
 
 # histórico de listagem + métricas de mercado (12 meses)
 python analise/acionador/listagem_historico.py --meses 12
@@ -299,6 +300,31 @@ Para a classe B, `--recuperar-oferta` é paliativo: salva a oferta e marca
 `tipo` como nulo, devolvendo as linhas ao histórico de DOM/absorção (que não
 filtra tipo) sem inventar um tipo que não existe. O reparo de verdade é
 recarregar aqueles seis CSVs com `BD/ingestao.py`.
+
+### 2.11 Piso de preço e área (19/10/2026)
+
+`FILTROS_OFERTA["VENDA"]["preco_min"]` era **R$ 500 mil** e `area_min` **40 m²**. Medido em
+jul–set/2026, isso tirava do estudo:
+
+| bairro / tipo | anúncios abaixo do piso | R$/m² nos anúncios | R$/m² no estudo |
+|---|---:|---:|---:|
+| RIACHO FUNDO II apto | 99,5% | 3.980 | 5.757 |
+| TAGUATINGA NORTE apto | 83,7% | 5.500 | 7.096 |
+| SAMAMBAIA SUL apto | 88,1% | 6.304 | 7.721 |
+| SANTA MARIA casa | 97,8% | 2.211 | (sem estudo) |
+| ASA NORTE apto 1 quarto | 46% | — | só os caros |
+
+O corte por preço é um corte na **variável medida**: sobra só a cauda de cima e a mediana sobe.
+Agora o piso é R$ 60 mil e a área mínima 18 m² (studio/kitnet); o lixo continua barrado por
+`vlm2_min` (R$ 1.000/m²) e pela winsorização. `quartos > 12` vira 0 (texto caído na coluna).
+Lote 2026-07/08/09 regerado em 19/10/2026: 193 escopos (eram 162), Santa Maria e Riacho Fundo II
+entraram, periferia caiu 18–46% no R$/m², Plano Piloto praticamente igual (mediana da variação −1%).
+
+### 2.12 A rodada de 07/10/2026 saiu sem a centena das Asas
+
+O `QUADRA_CENTENAS` entrou no commit `e27230e` (04/09). A rodada de 07/10 gravou quadras cruas
+("SQN 313 BLOCO E") em ASA NORTE/ASA SUL: a máquina que rodou estava num checkout anterior.
+`git pull` antes de `fluxo_mensal.py`. O `main` remoto parou em março; o ramo vivo é `master`.
 
 ---
 
