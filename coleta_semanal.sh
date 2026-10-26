@@ -9,11 +9,16 @@
 # Grava em dados/coletas/<portal>/AAAA-MM-DD.csv. O portal vem da PASTA e a
 # data do NOME, então nenhum arquivo .py precisa ser editado entre semanas.
 #
+# Cada arquivo é conferido e carregado no banco logo após a coleta
+# (BD/ingestao.py): lote com volume ou qualidade fora do histórico do portal é
+# REJEITADO e não entra. Sem credenciais no .env, só coleta.
+#
 #   chmod +x coleta_semanal.sh      (uma vez só)
 #
 #   ./coleta_semanal.sh                    # os dois portais, venda e aluguel
 #   ./coleta_semanal.sh --portal df        # só DF Imóveis
 #   ./coleta_semanal.sh --oferta venda
+#   ./coleta_semanal.sh --sem-banco        # só coleta, carga fica para depois
 #   ./coleta_semanal.sh --setup            # cria o .venv e instala as libs
 #
 # Para abrir com dois cliques no Finder, renomeie para coleta_semanal.command.
@@ -28,7 +33,10 @@ OFERTA="ambos"
 DATA="$(date +%Y-%m-%d)"
 WI_SEM_SEGMENTACAO=0
 WI_COM_DETALHES=0
+SEM_BANCO=0
 SETUP=0
+RESUMO=""
+FALHOU=0
 
 uso() {
     cat <<'FIM'
@@ -45,6 +53,7 @@ Uso: ./coleta_semanal.sh [opções]
                            NÃO recomendado: o site devolve 403 na paginação,
                            e sem segmentação a coleta lê só a primeira página
                            de cada escopo e para em ~1.900 anúncios.
+  --sem-banco              só coleta; não confere nem carrega no banco
   --setup                  cria o .venv e instala requirements
   -h, --help               esta ajuda
 FIM
@@ -57,6 +66,7 @@ while [ $# -gt 0 ]; do
         --data) DATA="$2"; shift 2 ;;
         --wi-com-detalhes) WI_COM_DETALHES=1; shift ;;
         --wi-sem-segmentacao) WI_SEM_SEGMENTACAO=1; shift ;;
+        --sem-banco) SEM_BANCO=1; shift ;;
         --setup) SETUP=1; shift ;;
         -h|--help) uso; exit 0 ;;
         *) echo "Opção desconhecida: $1" >&2; uso; exit 2 ;;
@@ -135,6 +145,40 @@ if [ -z "$DATA_DIR" ] && [ -f "$RAIZ/.env" ]; then
 fi
 [ -n "$DATA_DIR" ] || DATA_DIR="$RAIZ/dados"
 
+# A carga precisa de psycopg2/pandas/dotenv. Sem elas, só coleta.
+if [ "$SEM_BANCO" -eq 0 ] && ! "$PY" -c 'import psycopg2, pandas, dotenv' >/dev/null 2>&1; then
+    aviso "psycopg2/pandas/python-dotenv ausentes: só coleta, sem carga no banco."
+    SEM_BANCO=1
+fi
+
+anotar() { RESUMO="$RESUMO  $1 : $2
+"; }
+
+# ------------------------------------------------------------------
+# Conferência + carga de um arquivo
+# ------------------------------------------------------------------
+carregar() {
+    nome="$1"; arquivo="$2"
+
+    if [ "$SEM_BANCO" -eq 1 ]; then
+        anotar "$nome" "coletado, não carregado"
+        return 0
+    fi
+    msg "[$nome] conferindo e carregando no banco..."
+    # `|| rc=$?` impede o `set -e` de matar o script no exit 3 (rejeitado).
+    rc=0
+    "$PY" "$RAIZ/BD/ingestao.py" --arquivo "$arquivo" --portal "$nome" --oferta "$OFERTA" || rc=$?
+    case "$rc" in
+        0) ok "[$nome] carregado"; anotar "$nome" "carregado" ;;
+        2) aviso "[$nome] sem credenciais do banco — carga fica para depois"
+           anotar "$nome" "coletado, não carregado (sem credenciais)" ;;
+        3) erro "[$nome] LOTE REJEITADO — veja os [BLOQUEIO] acima"
+           anotar "$nome" "REJEITADO na conferência"; FALHOU=1 ;;
+        *) erro "[$nome] erro na carga (exit $rc)"
+           anotar "$nome" "ERRO na carga (exit $rc)"; FALHOU=1 ;;
+    esac
+}
+
 # ------------------------------------------------------------------
 # Coleta de um portal
 # ------------------------------------------------------------------
@@ -146,7 +190,10 @@ coletar() {
     saida="$pasta/$DATA.csv"
 
     if [ -f "$saida" ]; then
-        aviso "[$nome] $DATA.csv já existe — pulando."
+        # A carga é idempotente (hash): rodar de novo completa uma carga que
+        # tenha falhado sem refazer a coleta.
+        aviso "[$nome] $DATA.csv já existe — coleta pulada."
+        carregar "$nome" "$saida"
         return 0
     fi
 
@@ -158,6 +205,7 @@ coletar() {
         :
     else
         erro "[$nome] FALHOU (exit $?)"
+        anotar "$nome" "coleta FALHOU"; FALHOU=1
         return 0
     fi
 
@@ -167,8 +215,10 @@ coletar() {
         if [ "$total" -lt 100 ]; then
             aviso "[$nome] volume baixo. Rodada parcial ou bloqueio do portal?"
         fi
+        carregar "$nome" "$saida"
     else
         erro "[$nome] terminou sem gerar arquivo."
+        anotar "$nome" "coleta sem arquivo"; FALHOU=1
     fi
 }
 
@@ -191,6 +241,8 @@ if [ "$PORTAL" = "ambos" ] || [ "$PORTAL" = "wi" ]; then
 fi
 
 echo
-msg "Coleta de $DATA concluída."
+msg "Coleta de $DATA — resumo:"
+printf '%s' "$RESUMO"
 msg "Os CSVs estão em: $DATA_DIR/coletas/"
-msg "No início do mês, na máquina do banco: python fluxo_mensal.py"
+msg "No início do mês, na máquina do banco: python fluxo_mensal.py (estudo + histórico)"
+[ "$FALHOU" -eq 0 ] || exit 1

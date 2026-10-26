@@ -39,9 +39,12 @@ PGPASSWORD=...
 Rotina normal — dois comandos, nenhum arquivo `.py` editado:
 
 ```powershell
-.\coleta_semanal.ps1        # toda semana: DF e WI, cada um na sua pasta
-python fluxo_mensal.py       # início do mês: ingestão + estudo + histórico
+.\coleta_semanal.ps1        # toda semana: coleta DF e WI, confere o lote e carrega no banco
+python fluxo_mensal.py       # início do mês: estudo + histórico (+ carga do que ficou pendente)
 ```
+
+A carga é semanal desde out/2026 — ver §2.11. `-SemBanco` (ou `--sem-banco`
+no Mac) só coleta; o arquivo entra na próxima ingestão.
 
 Etapas avulsas:
 
@@ -325,6 +328,42 @@ entraram, periferia caiu 18–46% no R$/m², Plano Piloto praticamente igual (me
 O `QUADRA_CENTENAS` entrou no commit `e27230e` (04/09). A rodada de 07/10 gravou quadras cruas
 ("SQN 313 BLOCO E") em ASA NORTE/ASA SUL: a máquina que rodou estava num checkout anterior.
 `git pull` antes de `fluxo_mensal.py`. O `main` remoto parou em março; o ramo vivo é `master`.
+
+### 2.11 Carga semanal com conferência do lote
+
+A carga era mensal e só validava linha a linha. Os incidentes caros foram de
+**arquivo inteiro** e entraram sem alarme: replay no banco (out/2026) mostra
+DF 18/08 (573 linhas), 19/08 (633), 20/08 (sem aluguel), 08/09 (aluguel com
+31% do normal) e 23/09 (5.419). Coleta parcial é pior que coleta ausente:
+todo anúncio que não veio vira "saída", e DOM e absorção mentem.
+
+Agora `coleta_semanal` chama `BD/ingestao.py` logo após cada portal, e cada
+arquivo é comparado com a mediana das últimas 6 cargas do **mesmo portal**:
+
+| conferência | rejeita | avisa |
+|---|---|---|
+| volume por oferta | < 70% da mediana | < 90% |
+| aproveitamento (linhas válidas / lidas) | < 90% | |
+| % sem tipo | > histórico + 5 p.p. | |
+| % sem bairro | > histórico + 10 p.p. | |
+| % sem latitude | | > histórico + 15 p.p. |
+| já existe carga de (portal, data) com outro arquivo | sempre | |
+
+Limites relativos porque cada portal tem o seu normal (WI: 39% sem bairro,
+100% sem latitude). No replay, as 5 cargas ruins seriam rejeitadas e nenhuma
+boa. Lote rejeitado não entra e fica em `analytics.cargas` com `status =
+REJEITADA` e o `motivo`; `--forcar` grava mesmo assim (`status = FORCADA`).
+
+De carona:
+- `AAAA-MM-DD_segmentos.csv` (relatório do scraperWI) deixou de ser lido como
+  coleta — entrava toda semana com 0 linhas aproveitadas.
+- `codigo` sem dígito ou com mais de 30 caracteres é descartado na entrada
+  (cai para o id do anúncio): o scraperDF ainda solta ~3,5% de "PISO FRIO" e
+  afins em set/2026.
+- `coleta_semanal.ps1` gravado com BOM: sem ele o Windows PowerShell 5.1 lê o
+  arquivo como ANSI e o "—" quebra o parse.
+
+Testes: `python BD/testes_ingestao.py`.
 
 ---
 

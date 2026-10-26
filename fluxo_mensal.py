@@ -3,11 +3,14 @@
 Fluxo mensal completo — um comando, nenhuma edição de código.
 
     semana:  coleta_semanal.ps1   -> dados/coletas/<portal>/AAAA-MM-DD.csv
+                                   -> conferência do lote + carga no banco
     mês:     python fluxo_mensal.py
 
 Etapas, na ordem:
 
-    1. ingestão   arquivos pendentes -> tabela imoveis (idempotente)
+    1. ingestão   recuperação: carrega o que a semana não carregou (máquina
+                  sem banco, queda). O que já entrou é pulado pelo hash; lote
+                  rejeitado na conferência continua rejeitado.
     2. estudo     analytics.estudo_metricas      (preço pedido por segmento)
     3. histórico  analytics.listagem_historico   (vida de cada anúncio)
                   analytics.mercado_metricas     (DOM, absorção, desconto)
@@ -75,7 +78,11 @@ def main() -> None:
                 print(f"  {len(cargas)} arquivo(s) encontrado(s):")
                 for c in cargas:
                     print(f"    {c['portal']:3} {c['data_coleta']}  {c['arquivo'].name}")
-                ingestao.processar(cargas, dry_run=args.dry_run)
+                resumo = ingestao.processar(cargas, dry_run=args.dry_run)
+                if resumo["rejeitadas"]:
+                    # O estudo roda mesmo assim, mas a semana faltante aparece.
+                    falhas.append("ingestão (rejeitadas: "
+                                  + ", ".join(resumo["rejeitadas"]) + ")")
         except Exception:
             traceback.print_exc()
             falhas.append("ingestão")

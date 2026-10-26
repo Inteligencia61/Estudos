@@ -1,12 +1,17 @@
-# Coleta semanal — DF Imóveis e Wimóveis.
+﻿# Coleta semanal — DF Imóveis e Wimóveis.
 #
 # Grava em dados/coletas/<portal>/AAAA-MM-DD.csv. O portal vem da PASTA e a
 # data do NOME, então nenhum arquivo .py precisa ser editado entre semanas —
 # era isso que virava commit para limpar no `git pull`.
 #
+# Cada arquivo é conferido e carregado no banco logo após a coleta
+# (BD/ingestao.py): lote com volume ou qualidade fora do histórico do portal é
+# REJEITADO e não entra. O fluxo mensal fica só com estudo e histórico.
+#
 #   .\coleta_semanal.ps1                 # os dois portais, venda e aluguel
 #   .\coleta_semanal.ps1 -Portal df      # só DF Imóveis
 #   .\coleta_semanal.ps1 -Oferta venda
+#   .\coleta_semanal.ps1 -SemBanco       # só coleta, carga fica para depois
 
 param(
     [ValidateSet("ambos", "df", "wi")] [string]$Portal = "ambos",
@@ -21,7 +26,10 @@ param(
     # Sem detalhe a coleta é MUITO mais rápida, mas vem sem latitude,
     # longitude, código, creci e anunciante — e sem geo o dedupe físico entre
     # portais não funciona. Enriqueça depois com --entrada-csv.
-    [switch]$WiComDetalhes
+    [switch]$WiComDetalhes,
+    # Não carrega no banco (máquina sem credenciais, por exemplo). O arquivo
+    # fica em dados/coletas e entra na próxima ingestão.
+    [switch]$SemBanco
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,6 +46,29 @@ if (-not $dataDir) {
 }
 if (-not $dataDir) { $dataDir = Join-Path $raiz "dados" }
 
+$resultado = @{}
+
+function Invoke-Carga {
+    param([string]$Nome, [string]$Arquivo)
+
+    if ($SemBanco) {
+        $script:resultado[$Nome] = "coletado, não carregado (-SemBanco)"
+        return
+    }
+    Write-Host "[$Nome] conferindo e carregando no banco..." -ForegroundColor Cyan
+    python (Join-Path $raiz "BD\ingestao.py") --arquivo $Arquivo --portal $Nome --oferta $Oferta
+    switch ($LASTEXITCODE) {
+        0       { $script:resultado[$Nome] = "carregado"
+                  Write-Host "[$Nome] carregado" -ForegroundColor Green }
+        2       { $script:resultado[$Nome] = "coletado, não carregado (sem credenciais)"
+                  Write-Host "[$Nome] sem credenciais do banco — carga fica para depois" -ForegroundColor Yellow }
+        3       { $script:resultado[$Nome] = "REJEITADO na conferência"
+                  Write-Host "[$Nome] LOTE REJEITADO — veja os [BLOQUEIO] acima" -ForegroundColor Red }
+        default { $script:resultado[$Nome] = "ERRO na carga (exit $LASTEXITCODE)"
+                  Write-Host "[$Nome] erro na carga (exit $LASTEXITCODE)" -ForegroundColor Red }
+    }
+}
+
 function Invoke-Coleta {
     param([string]$Nome, [string]$Script, [string[]]$ExtraArgs = @())
 
@@ -46,7 +77,10 @@ function Invoke-Coleta {
     $saida = Join-Path $pasta "$Data.csv"
 
     if (Test-Path $saida) {
-        Write-Host "[$Nome] $Data.csv já existe — pulando." -ForegroundColor Yellow
+        # A carga é idempotente (hash): rodar de novo completa uma carga que
+        # tenha falhado sem refazer a coleta.
+        Write-Host "[$Nome] $Data.csv já existe — coleta pulada." -ForegroundColor Yellow
+        Invoke-Carga -Nome $Nome -Arquivo $saida
         return
     }
 
@@ -54,11 +88,13 @@ function Invoke-Coleta {
     python (Join-Path $raiz $Script) --oferta $Oferta --saida $saida @ExtraArgs
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[$Nome] FALHOU (exit $LASTEXITCODE)" -ForegroundColor Red
+        $script:resultado[$Nome] = "coleta FALHOU"
         return
     }
 
     $n = (Get-Content $saida | Measure-Object -Line).Lines - 1
     Write-Host "[$Nome] ok — $n linhas" -ForegroundColor Green
+    Invoke-Carga -Nome $Nome -Arquivo $saida
 }
 
 if ($Portal -in @("ambos", "df")) {
@@ -73,5 +109,7 @@ if ($Portal -in @("ambos", "wi")) {
 }
 
 Write-Host ""
-Write-Host "Coleta de $Data concluída. No início do mês, rode:" -ForegroundColor Cyan
-Write-Host "  python fluxo_mensal.py"
+Write-Host "Coleta de $Data — resumo:" -ForegroundColor Cyan
+foreach ($p in $resultado.Keys) { Write-Host "  $p : $($resultado[$p])" }
+Write-Host "No início do mês: python fluxo_mensal.py (estudo + histórico)" -ForegroundColor Cyan
+if ($resultado.Values | Where-Object { $_ -match "REJEITADO|FALHOU|ERRO" }) { exit 1 }
