@@ -15,6 +15,59 @@ pip install -r requirements.txt
 
 ## Rodar
 
+### Chrome normal conectado ao scraper
+
+Com a extensão do transporte nativo instalada, abra o DFImóveis, clique no
+ícone da extensão e em **Conectar ao scraper**. Mantenha o painel e a aba do
+portal abertos. Execute na raiz de Estudos:
+
+```powershell
+python scraper/scraperDF.py --chrome-nativo --oferta venda --cidades brasilia --bairros "asa sul" --fim 2 --limite 31 --delay 5 --saida amostra_df.csv
+```
+
+O Python continua controlando os filtros, a paginação, os detalhes de cada
+anúncio e a gravação do CSV. A extensão entrega o HTML da aba normal.
+Código e coordenadas são preenchidos quando disponíveis no anúncio.
+Falhas de conexão, bloqueios e páginas sem a estrutura esperada interrompem
+a coleta. O progresso lido fica em um arquivo .part, separado do CSV final.
+
+### Retomada automática
+
+Nas coletas online, o scraper grava os anúncios concluídos e a página em
+processamento em um arquivo ao lado da saída, por exemplo
+dfimoveis_completo.csv.checkpoint.sqlite3.
+
+Se o terminal fechar, o computador reiniciar ou a coleta for interrompida,
+conecte novamente o Chrome e repita o mesmo comando com o mesmo --saida.
+Os filtros, limites e a opção de detalhes devem ser os mesmos. Pausas,
+timeout e tentativas podem ser ajustados na retomada.
+
+O arquivo de checkpoint é necessário para retomar. Mantenha-o junto da
+saída. Um checkpoint concluído permite reexportar o CSV sem consultar o
+portal. Para começar uma nova coleta, use outro nome de saída.
+Arquivos .part antigos, gerados antes desse recurso, não contêm esse estado.
+
+Para a coleta semanal DFImóveis com esse transporte:
+
+```powershell
+.\coleta_semanal.ps1 -Portal df -DfChromeNativo -SemBanco
+```
+
+O exemplo usa -SemBanco para apenas gerar a coleta. A execução com carga
+mantém a conferência de qualidade existente no pipeline.
+
+Se a coleta HTTP receber o desafio da Cloudflare, há um modo de teste com
+Google Chrome visível. A partir da raiz de Estudos, com o Chrome instalado:
+
+```powershell
+python -m pip install playwright
+python scraper/scraperDF.py --chrome --oferta venda --cidades brasilia --bairros "asa sul" --fim 2 --limite 31 --sem-detalhes --timeout 90 --saida amostra_df.csv
+```
+
+Se o portal pedir verificação, conclua-a na janela do Chrome durante o tempo
+de `--timeout`. Uma coleta interrompida mantém os anúncios já lidos em um
+arquivo `.part`. O CSV final é publicado após a conclusão da coleta solicitada.
+
 Venda por cidade/bairro, ou cidade direta, ate a primeira pagina vazia de cada escopo:
 
 ```powershell

@@ -21,3 +21,8 @@ venv/
 .env
 # Coletas e arquivos de dados (fora do git: nunca vira commit)
 dados/
+
+# Canal local do transporte Chrome nativo e progresso parcial de coleta
+scraper/.chrome-nativo/
+*.part
+*.checkpoint.sqlite3

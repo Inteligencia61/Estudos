@@ -67,14 +67,11 @@ def _base_sintetica(n_imoveis: int = 400, n_duplicados: int = 30,
 def _pipeline(df_raw: pd.DataFrame, **kwargs):
     em = EstudoMercado(bairro="LAGO SUL", tipo="CASA", meses_alvo=["2026-05"], **kwargs)
     limpo = em._limpar_dados(df_raw)
-    scaler = km = mapping = None
-    try:
-        scaler, km, mapping = em._treinar_cluster_global(limpo, "LAGO SUL")
-    except Exception as e:
-        print(f"[WARN] cluster off: {e}")
+    # Mesmo caminho do _rodar_pipeline: lagos usam cluster por faixa de luxo.
+    cortes = em._treinar_cluster_por_faixa(limpo, "LAGO SUL/CASA")
     long = em._build_metricas_long(
         limpo, "2026-05", date(2026, 3, 1), date(2026, 5, 31),
-        "LAGO SUL", "CASA", scaler, km, mapping,
+        "LAGO SUL", "CASA", cortes_faixa=cortes,
     )
     return em, limpo, long
 
@@ -206,6 +203,98 @@ def teste_templates_sql():
     print("OK  templates SQL (chaves literais escapadas)")
 
 
+def teste_cluster_por_faixa():
+    """
+    Lagos: cada faixa de luxo com os 3 rótulos, sem grupo residual e sem
+    sobreposição de m² entre rótulos da mesma faixa. Reproduz o caso real do
+    LAGO SUL: ALTO LUXO concentrado em m² alto com cauda longa, que no
+    cluster do bairro inteiro ficava sem "Original".
+    """
+    rng = np.random.default_rng(7)
+    em = EstudoMercado(bairro="LAGO SUL", tipo="CASA CONDOMINIO")
+
+    def faixa(n, preco_min, preco_max, m2_med, cauda=0):
+        m2 = rng.lognormal(np.log(m2_med), 0.18, n)
+        m2[:cauda] = rng.uniform(32_000, 38_000, cauda)   # cauda de outliers
+        preco = rng.uniform(preco_min, preco_max, n)
+        return pd.DataFrame({"valor_m2": m2, "preco": preco, "area_util": preco / m2})
+
+    dados = pd.concat([
+        faixa(180, 8_100_000, 19_000_000, 19_000, cauda=8),   # ALTO LUXO
+        faixa(240, 2_500_000, 7_900_000, 8_500, cauda=5),     # LUXO
+        faixa(12, 600_000, 2_400_000, 4_000),                 # abaixo: pequeno
+    ], ignore_index=True)
+
+    cortes = em._treinar_cluster_por_faixa(dados, "teste")
+    assert set(cortes) == {"ALTO LUXO", "LUXO"}, f"faixas com cluster: {set(cortes)}"
+
+    out = em._aplicar_cluster_por_faixa(dados, cortes, "LAGO SUL")
+    assert (out["luxo"] != "").all(), "faixa sem amostra não pode entrar no cluster"
+    for f, g in out.groupby("luxo"):
+        parc = g["cluster_nome"].value_counts(normalize=True)
+        assert set(parc.index) == {"Original", "Reformado", "Nova"}, f"{f}: {dict(parc)}"
+        assert parc.min() >= em.CLUSTER_FAIXA_MIN_PARCELA - 0.01, f"{f}: grupo residual {dict(parc)}"
+        faixas_m2 = g.groupby("cluster_nome")["valor_m2"].agg(["min", "max"])
+        assert faixas_m2.loc["Original", "max"] < faixas_m2.loc["Reformado", "min"], f"{f}: sobreposição"
+        assert faixas_m2.loc["Reformado", "max"] < faixas_m2.loc["Nova", "min"], f"{f}: sobreposição"
+
+    # Treinado no período todo e aplicado a um pedaço: o rótulo não muda.
+    parte = em._aplicar_cluster_por_faixa(dados.iloc[::3], cortes, "LAGO SUL")
+    assert (parte["cluster_nome"] == out.loc[parte.index, "cluster_nome"]).all()
+    print("OK  cluster por faixa de luxo (3 rótulos por faixa, sem mistura)")
+
+
+def teste_coerencia_amostra_baixa():
+    """
+    Amostra baixa fica quando o valor é coerente com a série ou com o pai, e
+    sai quando diverge. Casos tirados do LAGO SUL real: casa < 75 m² a
+    R$ 37.282/m² com 1 imóvel (área errada no anúncio) contra pai de 8.249.
+    """
+    em = EstudoMercado(bairro="LAGO SUL", tipo="CASA")
+
+    def ponto(seg, mes, n, m2, **chave):
+        base = dict(segmento=seg, mes_ref=mes, vaga_cat="COM VAGA", luxo="LUXO",
+                    cluster_nome="", quartos=-1, metragem_fx="", quadra="",
+                    amostra=n, imoveis_unicos=n, m2_mediana=m2)
+        base.update(chave)
+        return base
+
+    out = pd.DataFrame([
+        ponto("GERAL_VAGA", "2026-10", 120, 8_249),
+        ponto("GERAL_VAGA", "2026-09", 110, 8_100),
+        # METRAGEM <75: 1 imóvel a 37 mil/m² — lixo, sai
+        ponto("METRAGEM_VAGA", "2026-10", 1, 37_282, metragem_fx="<75"),
+        # METRAGEM 1500-2000: 3 imóveis, 40% abaixo do pai — casa grande, fica
+        ponto("METRAGEM_VAGA", "2026-10", 3, 4_950, metragem_fx="1500-2000"),
+        # QUARTOS 5: forte em set, fraco em out e coerente com a série — fica
+        ponto("QUARTOS_VAGA", "2026-09", 20, 7_900, quartos=5),
+        ponto("QUARTOS_VAGA", "2026-10", 4, 8_300, quartos=5),
+        # QUARTOS 1: forte em set, fraco em out com valor de piso — sai
+        ponto("QUARTOS_VAGA", "2026-09", 18, 7_000, quartos=1),
+        ponto("QUARTOS_VAGA", "2026-10", 2, 2_400, quartos=1),
+        # ALTO LUXO sem pai robusto nem série robusta: corte antigo (>= 5)
+        ponto("QUADRA_VAGA", "2026-10", 6, 21_000, quadra="QI - Início", luxo="ALTO LUXO"),
+        ponto("QUADRA_VAGA", "2026-10", 2, 19_000, quadra="QI - Final", luxo="ALTO LUXO"),
+    ])
+    out["confiabilidade"] = em._classificar_confianca(out["imoveis_unicos"])
+    r = em._conferir_coerencia(out).set_index(["segmento", "mes_ref", "metragem_fx", "quartos", "quadra"])
+
+    def tem(*k):
+        return k in r.index
+
+    assert not tem("METRAGEM_VAGA", "2026-10", "<75", -1, ""), "lixo de 37 mil/m² passou"
+    assert tem("METRAGEM_VAGA", "2026-10", "1500-2000", -1, ""), "casa grande coerente caiu"
+    assert r.loc[("METRAGEM_VAGA", "2026-10", "1500-2000", -1, ""), "coerencia"] == "PAI"
+    assert tem("QUARTOS_VAGA", "2026-10", "", 5, ""), "ponto fraco coerente com a série caiu"
+    assert r.loc[("QUARTOS_VAGA", "2026-10", "", 5, ""), "coerencia"] == "SERIE"
+    assert not tem("QUARTOS_VAGA", "2026-10", "", 1, ""), "ponto no piso passou"
+    assert tem("QUARTOS_VAGA", "2026-09", "", 1, ""), "mês robusto da série não pode cair"
+    assert tem("QUADRA_VAGA", "2026-10", "", -1, "QI - Início"), "sem referência e n>=5 deve ficar"
+    assert not tem("QUADRA_VAGA", "2026-10", "", -1, "QI - Final"), "sem referência e n<5 deve sair"
+    assert (r.loc[r["confiabilidade"].isin(["ALTA", "MEDIA"]), "coerencia"] == "ROBUSTA").all()
+    print("OK  amostra baixa: coerente fica, divergente sai")
+
+
 if __name__ == "__main__":
     df_raw = _base_sintetica()
     print(f"base sintética: {len(df_raw)} linhas, {df_raw['codigo'].nunique()} códigos\n")
@@ -215,5 +304,7 @@ if __name__ == "__main__":
     teste_cauda(df_raw)
     teste_payload_upsert(df_raw)
     teste_agrupamento_quadras()
+    teste_cluster_por_faixa()
+    teste_coerencia_amostra_baixa()
     teste_templates_sql()
     print("\nTODOS OS TESTES PASSARAM")

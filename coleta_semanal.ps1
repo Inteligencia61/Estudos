@@ -27,6 +27,8 @@ param(
     # longitude, código, creci e anunciante — e sem geo o dedupe físico entre
     # portais não funciona. Enriqueça depois com --entrada-csv.
     [switch]$WiComDetalhes,
+    # Usa a extensao conectada ao Chrome normal para a coleta DFImoveis.
+    [switch]$DfChromeNativo,
     # Não carrega no banco (máquina sem credenciais, por exemplo). O arquivo
     # fica em dados/coletas e entra na próxima ingestão.
     [switch]$SemBanco
@@ -86,6 +88,11 @@ function Invoke-Coleta {
 
     Write-Host "[$Nome] coletando ($Oferta) $($ExtraArgs -join ' ') -> $saida" -ForegroundColor Cyan
     python (Join-Path $raiz $Script) --oferta $Oferta --saida $saida @ExtraArgs
+    if ($LASTEXITCODE -eq 4) {
+        Write-Host "[$Nome] PORTAL BLOQUEADO — desafio anti-robô da Cloudflare. Repetir não resolve." -ForegroundColor Red
+        $script:resultado[$Nome] = "coleta FALHOU (portal bloqueado pela Cloudflare)"
+        return
+    }
     if ($LASTEXITCODE -ne 0) {
         Write-Host "[$Nome] FALHOU (exit $LASTEXITCODE)" -ForegroundColor Red
         $script:resultado[$Nome] = "coleta FALHOU"
@@ -98,7 +105,9 @@ function Invoke-Coleta {
 }
 
 if ($Portal -in @("ambos", "df")) {
-    Invoke-Coleta -Nome "df" -Script "scraper\scraperDF.py"
+    $dfArgs = @()
+    if ($DfChromeNativo) { $dfArgs += "--chrome-nativo" }
+    Invoke-Coleta -Nome "df" -Script "scraper\scraperDF.py" -ExtraArgs $dfArgs
 }
 
 if ($Portal -in @("ambos", "wi")) {

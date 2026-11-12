@@ -201,10 +201,14 @@ coletar() {
 
     # `set -e` mataria o script inteiro se um portal falhasse; aqui o outro
     # portal ainda tem chance de rodar.
-    if "$PY" "$RAIZ/$script" --oferta "$OFERTA" --saida "$saida" "$@"; then
-        :
-    else
-        erro "[$nome] FALHOU (exit $?)"
+    rc=0
+    "$PY" "$RAIZ/$script" --oferta "$OFERTA" --saida "$saida" "$@" || rc=$?
+    if [ "$rc" -eq 4 ]; then
+        erro "[$nome] PORTAL BLOQUEADO — desafio anti-robô da Cloudflare. Repetir não resolve."
+        anotar "$nome" "coleta FALHOU (portal bloqueado pela Cloudflare)"; FALHOU=1
+        return 0
+    elif [ "$rc" -ne 0 ]; then
+        erro "[$nome] FALHOU (exit $rc)"
         anotar "$nome" "coleta FALHOU"; FALHOU=1
         return 0
     fi

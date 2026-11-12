@@ -128,19 +128,32 @@ class EstudoMercado:
     CLUSTER_FEATURES  = ["valor_m2", "area_util"]
     CLUSTER_N_PADRAO  = 9
 
-    # Override por bairro. Só o LAGO NORTE usa a configuração nova (03/08/2026):
-    # k=3 sobre apenas `valor_m2`.
-    #   - `area_util` fazia o KMeans separar por TAMANHO, não por condição: os
-    #     outliers de área capturavam um centro inteiro e deixavam um dos três
-    #     rótulos residual (0,4%).
-    #   - com k=9 + 2 features, remover ~0,2% das linhas da base reatribuía
-    #     ~20% dos imóveis de rótulo (instabilidade entre rodadas).
-    #   - k=3 sobre valor_m2: distribuição 25/51/24 e instabilidade 0,7%.
-    # Os demais bairros seguem no padrão para não exigir regravação em massa.
-    # A primeira feature é a usada para ordenar os centros e atribuir o rótulo.
-    CLUSTER_CONFIG: Dict[str, Dict[str, Any]] = {
-        "LAGO NORTE": {"n_clusters": 3, "features": ["valor_m2"]},
-    }
+    # Override por bairro: {"n_clusters": k, "features": [...]}. A primeira
+    # feature ordena os centros e atribui o rótulo. Os lagos NÃO passam por
+    # aqui: usam o cluster por faixa de luxo, abaixo.
+    CLUSTER_CONFIG: Dict[str, Dict[str, Any]] = {}
+
+    # Cluster de condição POR FAIXA DE LUXO nos lagos (06/11/2026).
+    #
+    # Antes: um KMeans para o bairro inteiro, depois cortado por faixa. O
+    # ALTO LUXO tem m² alto e caía quase todo nos centros de cima. Medido no
+    # LAGO SUL (venda, ago-out/2026): CASA CONDOMINIO / ALTO LUXO com 0
+    # "Original", LUXO com 0 "Nova", CASA / LUXO com 0,8% "Nova" — e o mesmo
+    # rótulo ia de R$ 2.400 a R$ 17.991/m² dentro de uma faixa.
+    #
+    # Agora cada faixa ("" / LUXO / ALTO LUXO) tem o seu próprio
+    # Original / Reformado / Nova, treinado só com os imóveis dela:
+    #   - KMeans k=3 sobre log(valor_m2): acha as quebras naturais, e o log
+    #     impede que a cauda de R$ 38 mil/m² capture um centro sozinha;
+    #   - trava de parcela mínima: nenhum dos três grupos fica abaixo de
+    #     CLUSTER_FAIXA_MIN_PARCELA da faixa (sem ela, KMeans puro ainda
+    #     deixava grupos de 3-9%);
+    #   - faixa com menos de CLUSTER_FAIXA_MIN_AMOSTRA imóveis fica sem
+    #     cluster (não entra em CLUSTER_VAGA) em vez de gerar rótulo com 2.
+    # Os rótulos continuam sendo faixas de m² (ver README §4): o que muda é
+    # que são faixas de m² DENTRO do mesmo patamar de preço.
+    CLUSTER_FAIXA_MIN_AMOSTRA = 30
+    CLUSTER_FAIXA_MIN_PARCELA = 0.15
 
     # ----------------------------------------------------------
     # Qualidade estatística
@@ -150,6 +163,30 @@ class EstudoMercado:
     # -8% com 6 imóveis de -8% com 180.
     CONFIABILIDADE_FAIXAS = [(30, "ALTA"), (15, "MEDIA"), (5, "BAIXA")]
     CONFIABILIDADE_MINIMA = "INSUFICIENTE"
+
+    # Amostra baixa entra no estudo se o valor for COERENTE (11/2026).
+    #
+    # Ponto BAIXA/INSUFICIENTE dá noção do segmento, desde que não seja lixo:
+    # casa < 75 m² a R$ 37.282/m² no LAGO SUL (n=1, +352% sobre o bairro) é
+    # área errada no anúncio, não mercado. O corte antigo era só por tamanho
+    # — descartava ~4.300 pontos coerentes e deixava passar 267 incoerentes
+    # (série com um mês forte levava junto os meses fracos, sem olhar valor).
+    #
+    # Referência, nesta ordem:
+    #   1. a própria série: mediana dos meses ALTA/MEDIA da janela;
+    #   2. o pai: GERAL_VAGA do mesmo mês, vaga e faixa de luxo, se robusto.
+    # Tolerância = p99 do desvio que segmentos ROBUSTOS mostram contra a mesma
+    # referência (medido em 7 escopos, venda, mai-out/2026): é o maior
+    # afastamento que um segmento sólido de verdade apresenta. METRAGEM é
+    # larga porque tamanho muda muito o m²; QUADRA porque há quadra nobre.
+    # Sem referência robusta nenhuma, vale o corte antigo por tamanho.
+    TOLERANCIA_COERENCIA: Dict[str, float] = {
+        "SERIE":         0.30,
+        "QUARTOS_VAGA":  0.30,
+        "QUADRA_VAGA":   0.50,
+        "METRAGEM_VAGA": 0.75,
+        "CLUSTER_VAGA":  0.65,
+    }
 
     # Tolerâncias do dedupe físico: o mesmo imóvel anunciado por várias
     # imobiliárias entra com códigos diferentes e conta N vezes na mediana.
@@ -296,6 +333,9 @@ class EstudoMercado:
         # True  = corte por série (mantém a linha do gráfico de evolução)
         # False = corte por ponto (comportamento anterior)
         corte_por_serie: bool = True,
+        # True  = mantém amostra baixa coerente (ver TOLERANCIA_COERENCIA)
+        # False = só o corte por tamanho (comportamento anterior)
+        manter_amostra_baixa: bool = True,
     ):
         self.data = date.today()
 
@@ -346,6 +386,7 @@ class EstudoMercado:
         self.upsert_page_size  = upsert_page_size
         self.min_amostra_segmento = min_amostra_segmento
         self.corte_por_serie      = corte_por_serie
+        self.manter_amostra_baixa = manter_amostra_baixa
         self.auto_escopo          = bool(auto_escopo)
         self.min_linhas_escopo    = int(min_linhas_escopo)
 
@@ -421,6 +462,8 @@ class EstudoMercado:
           variacao_repeat_pct double precision,
           n_repeat       int,
           confiabilidade text,
+          coerencia      text,
+          desvio_ref_pct double precision,
           gerado_em      timestamp not null default now(),
           primary key (
             bairro, tipo, oferta,
@@ -460,6 +503,11 @@ class EstudoMercado:
                 add column if not exists n_repeat int;
                 alter table {schema}.{tbl}
                 add column if not exists confiabilidade text;
+                -- Amostra baixa conferida contra referência robusta.
+                alter table {schema}.{tbl}
+                add column if not exists coerencia text;
+                alter table {schema}.{tbl}
+                add column if not exists desvio_ref_pct double precision;
             """)
 
     # ----------------------------------------------------------
@@ -863,13 +911,7 @@ class EstudoMercado:
 
         centers_real = scaler.inverse_transform(km.cluster_centers_)
         order = pd.DataFrame(centers_real, columns=feats).sort_values("valor_m2").index.tolist()
-
-        # LAGO SUL / LAGO NORTE usam a nomenclatura simplificada
-        # Original / Reformado / Nova
-        if self._bairro_usa_regra_lagos(bairro):
-            labels = ["Original", "Reformado", "Nova"]
-        else:
-            labels = ["01 - Original", "02 - Semi-Reformado", "03 - Reformado"]
+        labels = self._rotulos_condicao(bairro)
 
         # Distribui os centros (já ordenados por valor_m2) nos 3 rótulos,
         # independente de kmeans_n_clusters:
@@ -890,6 +932,89 @@ class EstudoMercado:
         X = scaler.transform(dfc[feats])
         dfc["cluster_id"]   = km.predict(X)
         dfc["cluster_nome"] = dfc["cluster_id"].map(mapping).astype("string").fillna("")
+        return dfc
+
+    def _rotulos_condicao(self, bairro: str) -> List[str]:
+        # LAGO SUL / LAGO NORTE usam a nomenclatura simplificada
+        if self._bairro_usa_regra_lagos(bairro):
+            return ["Original", "Reformado", "Nova"]
+        return ["01 - Original", "02 - Semi-Reformado", "03 - Reformado"]
+
+    # ----------------------------------------------------------
+    # Clusterização por faixa de luxo (lagos)
+    # ----------------------------------------------------------
+
+    def _cortes_condicao(self, valor_m2: pd.Series) -> Optional[np.ndarray]:
+        """
+        Dois cortes de valor_m2 que dividem UMA faixa de luxo em três grupos.
+        None quando a faixa não tem amostra para três grupos.
+        """
+        x = pd.to_numeric(valor_m2, errors="coerce")
+        x = x[x > 0].to_numpy(dtype=float)
+        if len(x) < self.CLUSTER_FAIXA_MIN_AMOSTRA or np.unique(x).size < 3:
+            return None
+
+        # Quebras naturais em log(m²), expressas como parcela acumulada.
+        v = np.log(x)
+        if SKLEARN_OK:
+            km = KMeans(n_clusters=3, random_state=self.random_state, n_init=10)
+            km.fit(v.reshape(-1, 1))
+            c = np.sort(km.cluster_centers_.ravel())
+            meio = (c[:-1] + c[1:]) / 2
+            p1, p2 = float((v < meio[0]).mean()), float((v < meio[1]).mean())
+        else:
+            p1, p2 = 1 / 3, 2 / 3
+
+        # Trava: cada grupo com pelo menos `m` da faixa.
+        m = self.CLUSTER_FAIXA_MIN_PARCELA
+        p1 = min(max(p1, m), 1 - 2 * m)
+        p2 = min(max(p2, p1 + m), 1 - m)
+        cortes = np.quantile(x, [p1, p2])
+
+        # Empate maciço num valor (ex.: piso da winsorização) pode esvaziar o
+        # grupo do meio; aí os tercis são a única divisão que sobra.
+        if np.bincount(np.digitize(x, cortes), minlength=3).min() == 0:
+            cortes = np.quantile(x, [1 / 3, 2 / 3])
+            if np.bincount(np.digitize(x, cortes), minlength=3).min() == 0:
+                return None
+        return cortes
+
+    def _treinar_cluster_por_faixa(self, df_treino: pd.DataFrame,
+                                   rotulo: str = "") -> Dict[str, np.ndarray]:
+        """{faixa de luxo: cortes}. Faixa sem amostra fica de fora."""
+        base = self._aplicar_faixa_luxo_lagos(df_treino.dropna(subset=["valor_m2", "preco"]))
+        cortes: Dict[str, np.ndarray] = {}
+        for faixa, g in base.groupby(base["luxo"].astype(str)):
+            nome = faixa or "abaixo de LUXO"
+            c = self._cortes_condicao(g["valor_m2"])
+            if c is None:
+                print(f"[CLUSTER] {rotulo} {nome}: {len(g)} imóveis — sem cluster (amostra pequena)")
+                continue
+            parc = np.bincount(np.digitize(g["valor_m2"], c), minlength=3) / len(g)
+            print(f"[CLUSTER] {rotulo} {nome}: {len(g)} imóveis · "
+                  f"{'/'.join(f'{p:.0%}' for p in parc)} · cortes R$ {c[0]:,.0f} | R$ {c[1]:,.0f} /m²"
+                  .replace(",", "."))
+            cortes[faixa] = c
+        return cortes
+
+    def _aplicar_cluster_por_faixa(self, dados: pd.DataFrame, cortes: Dict[str, np.ndarray],
+                                   bairro: str = "") -> pd.DataFrame:
+        """Rótulo de condição dentro da faixa de luxo de cada imóvel."""
+        dfc = dados.dropna(subset=["valor_m2", "preco"]).copy()
+        if "luxo" not in dfc.columns:
+            dfc = self._aplicar_faixa_luxo_lagos(dfc)
+        faixa = dfc["luxo"].astype(str)
+        dfc = dfc[faixa.isin(cortes.keys())].copy()
+        if dfc.empty:
+            return dfc
+        faixa = dfc["luxo"].astype(str)
+        ids = pd.Series(-1, index=dfc.index, dtype=int)
+        for f, c in cortes.items():
+            sel = faixa == f
+            ids[sel] = np.digitize(dfc.loc[sel, "valor_m2"].to_numpy(dtype=float), c)
+        labels = self._rotulos_condicao(bairro)
+        dfc["cluster_id"] = ids
+        dfc["cluster_nome"] = ids.map(dict(enumerate(labels))).astype("string").fillna("")
         return dfc
 
     # ----------------------------------------------------------
@@ -1085,6 +1210,7 @@ class EstudoMercado:
         bairro: str,
         tipo: str,
         scaler=None, km=None, mapping=None,
+        cortes_faixa: Optional[Dict[str, np.ndarray]] = None,
     ) -> pd.DataFrame:
         if dados_janela.empty:
             return pd.DataFrame()
@@ -1107,17 +1233,20 @@ class EstudoMercado:
             g["quartos"] = -1
             linhas.append(g)
 
-        # 2) CLUSTER_VAGA
-        if self.clusters_ativos and scaler is not None and km is not None:
+        # 2) CLUSTER_VAGA — nos lagos, por faixa de luxo
+        dfc = pd.DataFrame()
+        if self.clusters_ativos and cortes_faixa:
+            dfc = self._aplicar_cluster_por_faixa(base, cortes_faixa, bairro)
+        elif self.clusters_ativos and scaler is not None and km is not None:
             dfc = self._aplicar_cluster_fixo(base, scaler, km, mapping, bairro)
-            if not dfc.empty:
-                dfc["luxo"] = dfc["luxo"].astype("string").fillna("")
-                c = self._agg_completo(dfc, ["mes_ref", "vaga_cat", "cluster_nome", "luxo"])
-                if not c.empty:
-                    c["segmento"] = "CLUSTER_VAGA"
-                    c["metragem_fx"] = c["quadra"] = ""
-                    c["quartos"] = -1
-                    linhas.append(c)
+        if not dfc.empty:
+            dfc["luxo"] = dfc["luxo"].astype("string").fillna("")
+            c = self._agg_completo(dfc, ["mes_ref", "vaga_cat", "cluster_nome", "luxo"])
+            if not c.empty:
+                c["segmento"] = "CLUSTER_VAGA"
+                c["metragem_fx"] = c["quadra"] = ""
+                c["quartos"] = -1
+                linhas.append(c)
 
         # 3) QUARTOS_VAGA
         qbase = base[base["quartos"] > 0].copy()
@@ -1152,8 +1281,12 @@ class EstudoMercado:
             return pd.DataFrame()
 
         out = pd.concat(linhas, ignore_index=True)
+        out["confiabilidade"] = self._classificar_confianca(
+            out["imoveis_unicos"] if "imoveis_unicos" in out.columns else out["amostra"])
 
-        if self.corte_por_serie:
+        if self.manter_amostra_baixa:
+            out = self._conferir_coerencia(out)
+        elif self.corte_por_serie:
             # Corte POR SÉRIE, não por ponto: a combinação é mantida em todos os
             # mes_ref da janela se atingir min_amostra_segmento em ALGUM mês.
             # Sem isso, um mês fraco apaga o ponto e quebra a linha do gráfico de
@@ -1189,6 +1322,9 @@ class EstudoMercado:
                 out[col] = default
         out["n_repeat"] = pd.to_numeric(out["n_repeat"], errors="coerce").fillna(0).astype(int)
         out["confiabilidade"] = self._classificar_confianca(out["imoveis_unicos"])
+        for col, default in (("coerencia", "NAO_CONFERIDA"), ("desvio_ref_pct", np.nan)):
+            if col not in out.columns:
+                out[col] = default
 
         out = self._add_variacao_mensal(out)
 
@@ -1201,7 +1337,68 @@ class EstudoMercado:
             "m2_medio", "m2_mediana", "m2_p25", "m2_p75", "m2_desvio",
             "preco_mediana", "area_mediana",
             "variacao_m2_pct", "variacao_repeat_pct", "n_repeat", "confiabilidade",
+            "coerencia", "desvio_ref_pct",
         ]]
+
+    def _conferir_coerencia(self, out: pd.DataFrame) -> pd.DataFrame:
+        """
+        Mantém ponto de amostra baixa quando o valor é coerente com uma
+        referência robusta; descarta quando diverge. Recebe UMA janela
+        (um mes_alvo) com todos os mes_ref.
+
+        coerencia:  ROBUSTA         ALTA/MEDIA, não precisa conferir
+                    SERIE           conferido contra os meses fortes da série
+                    PAI             conferido contra o GERAL_VAGA do mês
+                    SEM_REFERENCIA  nada robusto para comparar; vale o corte
+                                    antigo por tamanho
+        `desvio_ref_pct`: distância do ponto à referência usada.
+        """
+        if out.empty:
+            return out
+        out = out.copy()
+        robusto = out["confiabilidade"].isin(["ALTA", "MEDIA"])
+
+        # 1. Série: mediana dos meses robustos.
+        ref_serie = (
+            out[robusto].groupby(self.CHAVE_SERIE, dropna=False)["m2_mediana"]
+            .median().rename("_ref_serie").reset_index()
+        )
+        out = out.merge(ref_serie, on=self.CHAVE_SERIE, how="left")
+
+        # 2. Pai: GERAL_VAGA robusto do mesmo mês, vaga e faixa de luxo.
+        chave_pai = ["mes_ref", "vaga_cat", "luxo"]
+        ref_pai = (
+            out[(out["segmento"] == "GERAL_VAGA") & robusto.to_numpy()]
+            [chave_pai + ["m2_mediana"]].rename(columns={"m2_mediana": "_ref_pai"})
+            .drop_duplicates(subset=chave_pai)
+        )
+        out = out.merge(ref_pai, on=chave_pai, how="left")
+        out.loc[out["segmento"] == "GERAL_VAGA", "_ref_pai"] = np.nan
+
+        robusto = out["confiabilidade"].isin(["ALTA", "MEDIA"])
+        usa_serie = ~robusto & out["_ref_serie"].notna()
+        usa_pai = ~robusto & ~usa_serie & out["_ref_pai"].notna()
+        ref = out["_ref_serie"].where(usa_serie, out["_ref_pai"].where(usa_pai))
+        desvio = out["m2_mediana"] / ref - 1.0
+        tol = out["segmento"].map(self.TOLERANCIA_COERENCIA).where(
+            usa_pai, self.TOLERANCIA_COERENCIA["SERIE"])
+
+        out["coerencia"] = np.select(
+            [robusto, usa_serie, usa_pai], ["ROBUSTA", "SERIE", "PAI"], "SEM_REFERENCIA")
+        out["desvio_ref_pct"] = (desvio * 100).round(1)
+
+        diverge = (usa_serie | usa_pai) & (desvio.abs() > tol.astype(float))
+        sem_ref = out["coerencia"] == "SEM_REFERENCIA"
+        sem_ref_fraco = sem_ref & (
+            out.groupby(self.CHAVE_SERIE, dropna=False)["amostra"].transform("max")
+            < self.min_amostra_segmento
+        )
+        if diverge.any() or sem_ref_fraco.any():
+            print(f"[COERÊNCIA] {int(diverge.sum())} ponto(s) de amostra baixa divergente(s) "
+                  f"e {int(sem_ref_fraco.sum())} sem referência — descartados; "
+                  f"{int((~robusto & ~diverge & ~sem_ref_fraco).sum())} mantidos")
+        out = out[~diverge & ~sem_ref_fraco]
+        return out.drop(columns=["_ref_serie", "_ref_pai"]).reset_index(drop=True)
 
     def _add_variacao_mensal(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calcula variação % de m2_mediana entre meses consecutivos dentro do mesmo segmento."""
@@ -1258,6 +1455,7 @@ class EstudoMercado:
             "m2_medio", "m2_mediana", "m2_p25", "m2_p75", "m2_desvio",
             "preco_mediana", "area_mediana",
             "variacao_m2_pct", "variacao_repeat_pct", "n_repeat", "confiabilidade",
+            "coerencia", "desvio_ref_pct",
         ]
         bloco = df_long[cols].astype(object)
         bloco = bloco.where(bloco.notna(), None)
@@ -1271,7 +1469,8 @@ class EstudoMercado:
               amostra, imoveis_unicos,
               m2_medio, m2_mediana, m2_p25, m2_p75, m2_desvio,
               preco_mediana, area_mediana,
-              variacao_m2_pct, variacao_repeat_pct, n_repeat, confiabilidade
+              variacao_m2_pct, variacao_repeat_pct, n_repeat, confiabilidade,
+              coerencia, desvio_ref_pct
             ) values %s
         """).format(schema=psql.Identifier(schema), tbl=psql.Identifier(tbl))
 
@@ -1303,9 +1502,14 @@ class EstudoMercado:
             return pd.DataFrame()
 
         scaler = km = mapping = None
+        cortes_faixa = None
         if self.clusters_ativos:
             try:
-                scaler, km, mapping = self._treinar_cluster_global(df_limpo, bairro)
+                if self._bairro_usa_regra_lagos(bairro):
+                    cortes_faixa = self._treinar_cluster_por_faixa(
+                        df_limpo, f"{bairro}/{tipo}/{self.oferta}")
+                else:
+                    scaler, km, mapping = self._treinar_cluster_global(df_limpo, bairro)
             except Exception as e:
                 print(f"[WARN] Cluster desativado para {bairro}/{tipo}: {e}")
 
@@ -1318,7 +1522,8 @@ class EstudoMercado:
             if janela.empty:
                 continue
             df_long = self._build_metricas_long(
-                janela, ym, ini, fim, bairro, tipo, scaler, km, mapping
+                janela, ym, ini, fim, bairro, tipo, scaler, km, mapping,
+                cortes_faixa=cortes_faixa,
             )
             if not df_long.empty:
                 partes.append(df_long)
@@ -1495,11 +1700,18 @@ class EstudoMercado:
         df = self.df_analisado.copy()
 
         # tenta criar cluster para visualização
-        scaler = km = mapping = None
+        bairro = self.bairro_unico or ""
         if self.clusters_ativos and SKLEARN_OK:
             try:
-                scaler, km, mapping = self._treinar_cluster_global(df, self.bairro_unico or "")
-                df = self._aplicar_cluster_fixo(df, scaler, km, mapping, self.bairro_unico or "")
+                if self._bairro_usa_regra_lagos(bairro):
+                    cortes = self._treinar_cluster_por_faixa(df, bairro)
+                    df = self._aplicar_cluster_por_faixa(df, cortes, bairro)
+                    # Mesmo rótulo em faixas diferentes não é o mesmo grupo.
+                    df["cluster_nome"] = (df["luxo"].astype(str).replace("", "abaixo de LUXO")
+                                          + " · " + df["cluster_nome"].astype(str))
+                else:
+                    scaler, km, mapping = self._treinar_cluster_global(df, bairro)
+                    df = self._aplicar_cluster_fixo(df, scaler, km, mapping, bairro)
             except Exception as e:
                 print(f"[WARN] Não foi possível gerar clusters para o gráfico: {e}")
 

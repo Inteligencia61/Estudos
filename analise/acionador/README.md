@@ -365,6 +365,72 @@ De carona:
 
 Testes: `python BD/testes_ingestao.py`.
 
+### 2.12 Lagos: cluster de condição por faixa de luxo
+
+`CLUSTER_VAGA` agrega por `(cluster_nome, luxo)`, mas o KMeans de condição
+era treinado no bairro inteiro e só depois cortado por faixa. O ALTO LUXO tem
+m² alto e caía quase todo nos centros de cima. Medido no LAGO SUL (venda,
+ago-out/2026):
+
+| | Original | Reformado | Nova |
+|---|---|---|---|
+| CASA CONDOMINIO · ALTO LUXO | **0** | 79 | 101 |
+| CASA CONDOMINIO · LUXO | 130 | 109 | **0** |
+| CASA · LUXO | 51 | 2.634 | 21 |
+
+E o mesmo rótulo misturava patamares: "Reformado" em CASA · LUXO ia de
+R$ 2.400 a R$ 17.991/m².
+
+Agora, nos lagos, cada faixa (abaixo de LUXO / LUXO / ALTO LUXO) tem o seu
+próprio Original / Reformado / Nova, treinado só com os imóveis da faixa:
+KMeans k=3 sobre `log(valor_m2)` para achar as quebras, com trava de 15% de
+parcela mínima por grupo (`CLUSTER_FAIXA_MIN_PARCELA`). KMeans puro, com ou
+sem log, ainda deixava grupos de 3-9%. Faixa com menos de 30 imóveis
+(`CLUSTER_FAIXA_MIN_AMOSTRA`) fica fora de `CLUSTER_VAGA`.
+
+Depois, mesmo recorte: LAGO SUL CASA · ALTO LUXO 31/41/28%, CASA CONDOMINIO ·
+ALTO LUXO 22/62/16%, sem sobreposição de m² entre rótulos da mesma faixa. O
+modelo é treinado uma vez no período todo e aplicado a cada mês, como antes.
+
+A entrada `LAGO NORTE` de `CLUSTER_CONFIG` saiu: os dois lagos usam este
+caminho. Bairros sem faixa de luxo não mudam.
+
+**Efeito no BI:** a próxima rodada regrava `CLUSTER_VAGA` dos lagos com os
+rótulos novos. A série antiga desses rótulos não é comparável com a nova.
+
+### 2.13 Amostra baixa entra quando é coerente
+
+`manter_amostra_baixa=True` (padrão) · colunas novas `coerencia`, `desvio_ref_pct`
+
+O corte era só por tamanho: série sem nenhum mês com 5 imóveis sumia, e série
+com um mês forte levava os meses fracos junto sem olhar o valor. Simulação em
+7 escopos (venda, mai-out/2026): ~4.300 pontos coerentes descartados e **267
+incoerentes gravados** — entre eles casa < 75 m² no LAGO SUL a R$ 37.282/m²
+(1 imóvel, +352% sobre o bairro: área errada no anúncio).
+
+Agora ponto BAIXA/INSUFICIENTE é conferido contra uma referência robusta:
+
+| `coerencia` | referência | tolerância |
+|---|---|---|
+| `ROBUSTA` | ponto ALTA/MEDIA, não confere | — |
+| `SERIE` | mediana dos meses ALTA/MEDIA da mesma série | 30% |
+| `PAI` | `GERAL_VAGA` robusto do mesmo mês, vaga e faixa de luxo | QUARTOS 30% · QUADRA 50% · CLUSTER 65% · METRAGEM 75% |
+| `SEM_REFERENCIA` | nada robusto para comparar | corte antigo (série com algum mês >= 5) |
+
+Tolerância = p99 do desvio que segmentos **robustos** mostram contra a mesma
+referência: o maior afastamento de um segmento sólido de verdade. Divergente
+sai; coerente fica com o carimbo de confiabilidade que já tinha.
+
+Efeito, pontos gravados por escopo: LAGO SUL CASA 789 → 862, PARK WAY CASA
+586 → 1.496, SUDOESTE APARTAMENTO 605 → 2.318 (a maioria `QUADRA_VAGA` de
+bloco com 1-4 imóveis).
+
+**Para quem lê o BI:** o volume de pontos `INSUFICIENTE` sobe bastante. Visão
+de tendência continua filtrando `confiabilidade in (ALTA, MEDIA)`; os pontos
+fracos servem para "ter uma noção" do segmento e sempre trazem
+`desvio_ref_pct` para mostrar o quanto se afastam da referência.
+`manter_amostra_baixa=False` volta ao corte antigo.
+
 ---
 
 ## 3. O que `listagem_historico.py` acrescenta

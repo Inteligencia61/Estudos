@@ -5,17 +5,27 @@ import csv
 import html
 import json
 import re
+import sqlite3
 import sys
+import tempfile
 import time
 import unicodedata
+from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import date
+from functools import partial
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from dfimoveis_native import ChromeNativeTransport, NativeTransportError
+from dfimoveis_checkpoint import CollectionCheckpoint, CheckpointError
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
 
 
 BASE_URL = "https://www.dfimoveis.com.br"
@@ -209,6 +219,33 @@ def make_soup(raw: str) -> BeautifulSoup:
 # fim de paginacao, nao uma falha.
 STATUS_RETENTAVEIS = {429, 500, 502, 503, 504}
 
+# Codigo de saida quando o portal exige o desafio anti-robo da Cloudflare.
+SAIDA_PORTAL_BLOQUEADO = 4
+
+
+class PortalBloqueado(RuntimeError):
+    """O portal respondeu com o desafio da Cloudflare ("Just a moment...").
+
+    Desde 11/2026 o DF Imoveis responde 403 + `cf-mitigated: challenge` em
+    todas as paginas, inclusive a inicial. Antes este 403 caia no retry
+    generico: 4 tentativas por pagina, escopo a escopo, horas de execucao e
+    um CSV vazio no fim com saida 0. Repetir nao resolve — a coleta para na
+    primeira pagina.
+    """
+
+
+class ColetaIncompleta(RuntimeError):
+    """A listagem nao foi coletada por completo."""
+
+
+def _e_desafio_cloudflare(response: requests.Response) -> bool:
+    if response.status_code not in (403, 503):
+        return False
+    if response.headers.get("cf-mitigated", "").lower() == "challenge":
+        return True
+    inicio = response.text[:5000].lower()
+    return "just a moment" in inicio or "challenge-platform" in inicio
+
 
 def fetch(
     session: requests.Session,
@@ -227,6 +264,11 @@ def fetch(
     for tentativa in range(retries + 1):
         try:
             response = session.get(url, timeout=timeout)
+            if _e_desafio_cloudflare(response):
+                raise PortalBloqueado(
+                    f"{url} respondeu {response.status_code} com desafio da Cloudflare "
+                    f"(cf-ray {response.headers.get('cf-ray', '?')})"
+                )
             if response.status_code in STATUS_RETENTAVEIS:
                 raise requests.HTTPError(
                     f"status {response.status_code}", response=response
@@ -254,6 +296,42 @@ def fetch(
             time.sleep(espera)
 
     raise ultimo_erro
+
+
+def fetch_chrome(page: Page, url: str, timeout: int) -> str:
+    from playwright.sync_api import Error, TimeoutError
+
+    timeout_ms = timeout * 1000
+    try:
+        response = page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+        if response is None:
+            raise requests.RequestException(f"Chrome nao recebeu resposta de {url}")
+        if response.headers.get("cf-mitigated") == "challenge":
+            print("Verificacao do DF Imoveis: conclua-a na janela do Chrome se solicitada.",
+                  file=sys.stderr)
+            try:
+                response = page.wait_for_event(
+                    "response",
+                    predicate=lambda item: (
+                        item.request.is_navigation_request()
+                        and item.frame == page.main_frame
+                        and item.url.split("#")[0] == url.split("#")[0]
+                        and item.headers.get("cf-mitigated") != "challenge"
+                    ),
+                    timeout=timeout_ms,
+                )
+            except TimeoutError as exc:
+                raise PortalBloqueado(f"Verificacao pendente em {url}") from exc
+            page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        if response.status == 403:
+            raise PortalBloqueado(f"{url} respondeu 403 no Chrome")
+        if response.status >= 400:
+            http_response = requests.Response()
+            http_response.status_code = response.status
+            raise requests.HTTPError(f"status {response.status} em {url}", response=http_response)
+        return page.content()
+    except Error as exc:
+        raise requests.RequestException(f"Falha no Chrome em {url}: {exc}") from exc
 
 
 def build_listing_url(oferta: str, pagina: int, scope: ListingScope | None = None) -> str:
@@ -467,24 +545,63 @@ def regex_group(text: str, pattern: str) -> str:
 
 def scrape(
     config: ScrapeConfig,
-    arquivo_listagem: Path | None = None,
+    arquivo_listagem: Path | list[Path] | None = None,
     checkpoint_path: Path | None = None,
+    *,
+    chrome: bool = False,
+    resume: CollectionCheckpoint | None = None,
 ) -> list[dict[str, str]]:
-    session = requests.Session()
-    session.headers.update(
-        {
+    if chrome and not arquivo_listagem:
+        try:
+            from playwright.sync_api import Error, sync_playwright
+        except ImportError as exc:
+            raise ColetaIncompleta("Instale playwright para usar --chrome.") from exc
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(channel="chrome", headless=False)
+                page = browser.new_page(locale="pt-BR")
+                return scrape_pages(
+                    config, arquivo_listagem, checkpoint_path,
+                    partial(fetch_chrome, page, timeout=config.timeout),
+                    resume=resume,
+                )
+        except Error as exc:
+            raise ColetaIncompleta(f"Falha ao abrir ou executar o Chrome: {exc}") from exc
+
+    with requests.Session() as session:
+        session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0 Safari/537.36"
             ),
             "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-        }
-    )
+        })
+        return scrape_pages(
+            config, arquivo_listagem, checkpoint_path,
+            partial(fetch, session, timeout=config.timeout,
+                    retries=config.retries, backoff=config.backoff),
+            resume=resume,
+        )
+
+
+def scrape_pages(
+    config: ScrapeConfig,
+    arquivo_listagem: Path | list[Path] | None,
+    checkpoint_path: Path | None,
+    download: Callable[[str], str],
+    *,
+    strict: bool = False,
+    resume: CollectionCheckpoint | None = None,
+) -> list[dict[str, str]]:
 
     ofertas = ["venda", "aluguel"] if config.oferta == "ambos" else [config.oferta]
-    rows: list[dict[str, str]] = []
-    seen_links: set[str] = set()
+    rows: list[dict[str, str]] = resume.rows() if resume else []
+    seen_links: set[str] = {row["link"] for row in rows}
+    if checkpoint_path and rows:
+        write_csv(rows, checkpoint_path)
+    if resume and (resume.complete or (config.limite and len(rows) >= config.limite)):
+        return rows
     # (oferta, escopo, pagina, erro) — escopos que morreram apos esgotar as tentativas.
     escopos_com_falha: list[tuple[str, str, int, str]] = []
 
@@ -492,64 +609,129 @@ def scrape(
         for row in cards:
             if row["link"] in seen_links:
                 continue
-            seen_links.add(row["link"])
             if config.detalhes and not arquivo_listagem:
                 try:
                     print(f"Baixando detalhe: {row['link']}", file=sys.stderr)
-                    detail = parse_detail(
-                        fetch(session, row["link"], config.timeout,
-                              config.retries, config.backoff)
-                    )
+                    detail = parse_detail(download(row["link"]))
+                    if strict and not detail.get("id"):
+                        raise ColetaIncompleta(f"Detalhe sem estrutura reconhecida: {row['link']}")
+                    if strict and detail["id"] != row["id"]:
+                        raise ColetaIncompleta(f"Detalhe pertence a outro anuncio: {row['link']}")
                     row.update(detail)
                     time.sleep(config.delay)
                 except requests.RequestException as exc:
+                    if resume:
+                        raise ColetaIncompleta(f"Detalhe interrompido em {row['link']}: {exc}") from exc
                     print(f"Falha no detalhe {row['link']}: {exc}", file=sys.stderr)
-            rows.append({field: row.get(field, "") for field in CSV_FIELDS})
+            saved_row = {field: row.get(field, "") for field in CSV_FIELDS}
+            if resume:
+                resume.save_row(saved_row)
+            rows.append(saved_row)
+            seen_links.add(row["link"])
             if checkpoint_path:
-                write_csv(rows, checkpoint_path)
+                if len(rows) == 1:
+                    write_csv(rows, checkpoint_path)
+                else:
+                    with checkpoint_path.open("a", newline="", encoding="utf-8") as file:
+                        csv.DictWriter(file, fieldnames=CSV_FIELDS, quoting=csv.QUOTE_ALL).writerow(rows[-1])
             if config.limite and len(rows) >= config.limite:
                 return True
         return False
 
     if arquivo_listagem:
-        raw = arquivo_listagem.read_text(encoding="utf-8", errors="replace")
-        cards = parse_listing(raw)
-        print(f"{arquivo_listagem}: {len(cards)} imoveis encontrados", file=sys.stderr)
-        add_cards(cards)
+        arquivos = [arquivo_listagem] if isinstance(arquivo_listagem, Path) else arquivo_listagem
+        for arquivo in arquivos:
+            try:
+                raw = arquivo.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                raise ColetaIncompleta(f"Nao foi possivel ler {arquivo}: {exc}") from exc
+            cards = parse_listing(raw)
+            print(f"{arquivo}: {len(cards)} imoveis encontrados", file=sys.stderr)
+            if not cards:
+                raise ColetaIncompleta(f"{arquivo} nao contem anuncios reconhecidos.")
+            if add_cards(cards):
+                break
         return rows
 
-    for oferta in ofertas:
-        for scope in build_scopes(config):
-            pagina = config.inicio
-            while True:
-                if config.fim is not None and pagina > config.fim:
+    tasks = [(oferta, scope) for oferta in ofertas for scope in build_scopes(config)]
+    first_task, first_page = resume.position if resume else (0, config.inicio)
+    for task_index in range(first_task, len(tasks)):
+        oferta, scope = tasks[task_index]
+        pagina = first_page if task_index == first_task else config.inicio
+        seen_scope = resume.scope_links(task_index) if resume else set()
+        while True:
+            if config.fim is not None and pagina > config.fim:
+                if resume:
+                    resume.advance(task_index + 1, config.inicio)
+                break
+            url = build_listing_url(oferta, pagina, scope)
+            print(f"Baixando listagem: {url}", file=sys.stderr)
+            try:
+                stored_page = resume.pending(task_index, pagina) if resume else None
+                raw = stored_page if stored_page is not None else download(url)
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    print(f"Parando {oferta}/{scope.label}: pagina {pagina} retornou 404.", file=sys.stderr)
+                    if resume:
+                        resume.advance(task_index + 1, config.inicio)
                     break
-                url = build_listing_url(oferta, pagina, scope)
-                print(f"Baixando listagem: {url}", file=sys.stderr)
-                try:
-                    raw = fetch(session, url, config.timeout, config.retries, config.backoff)
-                except requests.HTTPError as exc:
-                    if exc.response is not None and exc.response.status_code == 404:
-                        print(f"Parando {oferta}/{scope.label}: pagina {pagina} retornou 404.", file=sys.stderr)
-                        break
-                    escopos_com_falha.append((oferta, scope.label, pagina, str(exc)))
-                    print(f"FALHA {oferta}/{scope.label} pagina {pagina}: {exc}. Pulando escopo.", file=sys.stderr)
-                    break
-                except requests.RequestException as exc:
-                    # Ja passou por todas as tentativas do fetch. Perder um escopo e
-                    # melhor do que perder a varredura inteira.
-                    escopos_com_falha.append((oferta, scope.label, pagina, str(exc)))
-                    print(f"FALHA {oferta}/{scope.label} pagina {pagina}: {exc}. Pulando escopo.", file=sys.stderr)
-                    break
-                cards = parse_listing(raw)
-                print(f"{url}: {len(cards)} imoveis encontrados", file=sys.stderr)
-                if not cards:
-                    print(f"Parando {oferta}/{scope.label}: pagina {pagina} sem imoveis.", file=sys.stderr)
-                    break
-                if add_cards(cards):
+                if resume:
+                    raise ColetaIncompleta(f"Listagem interrompida em {url}: {exc}") from exc
+                escopos_com_falha.append((oferta, scope.label, pagina, str(exc)))
+                print(f"FALHA {oferta}/{scope.label} pagina {pagina}: {exc}. Pulando escopo.", file=sys.stderr)
+                break
+            except requests.RequestException as exc:
+                if resume:
+                    raise ColetaIncompleta(f"Listagem interrompida em {url}: {exc}") from exc
+                # Ja passou por todas as tentativas do fetch. Perder um escopo e
+                # melhor do que perder a varredura inteira.
+                escopos_com_falha.append((oferta, scope.label, pagina, str(exc)))
+                print(f"FALHA {oferta}/{scope.label} pagina {pagina}: {exc}. Pulando escopo.", file=sys.stderr)
+                break
+            cards = parse_listing(raw)
+            soup = make_soup(raw) if strict else None
+            print(f"{url}: {len(cards)} imoveis encontrados", file=sys.stderr)
+            if not cards:
+                if strict:
+                    heading = text_of(soup.select_one(".busca-middle-column h1"))
+                    if not re.match(r"^0\s+Im[oó]ve(?:l|is)", heading, re.I):
+                        raise ColetaIncompleta(f"Listagem sem estrutura reconhecida: {url}")
+                print(f"Parando {oferta}/{scope.label}: pagina {pagina} sem imoveis.", file=sys.stderr)
+                if resume:
+                    resume.advance(task_index + 1, config.inicio)
+                break
+            if strict and stored_page is None and not ({card["link"] for card in cards} - seen_scope):
+                raise ColetaIncompleta(f"O portal repetiu os anuncios em {url}")
+            seen_scope.update(card["link"] for card in cards)
+            if resume and stored_page is None:
+                resume.save_page(task_index, pagina, raw, {card["link"] for card in cards})
+            if add_cards(cards):
+                if not escopos_com_falha:
                     return rows
-                pagina += 1
-                time.sleep(config.delay)
+                raise ColetaIncompleta("Limite atingido apos falha de listagem.")
+            if strict:
+                next_button = soup.select_one(".busca-pagination .next")
+                heading = text_of(soup.select_one(".busca-middle-column h1"))
+                total_match = re.match(r"^([\d.]+)\s+Im[oó]ve(?:l|is)", heading, re.I)
+                total = int(total_match.group(1).replace(".", "")) if total_match else None
+                finished = next_button and (
+                    "disabled" in next_button.get("class", [])
+                    or next_button.get("aria-disabled") == "true"
+                )
+                if not next_button:
+                    if total is None or total > len(cards):
+                        raise ColetaIncompleta(f"Paginacao ausente em {url}")
+                    finished = True
+                if finished:
+                    if config.inicio == 1 and total is not None and len(seen_scope) < total:
+                        raise ColetaIncompleta(f"{url}: {len(seen_scope)} anuncios coletados para {total} resultados")
+                    if resume:
+                        resume.advance(task_index + 1, config.inicio)
+                    break
+            pagina += 1
+            if resume:
+                resume.advance(task_index, pagina)
+            time.sleep(config.delay)
 
     if escopos_com_falha:
         print("", file=sys.stderr)
@@ -561,6 +743,7 @@ def scrape(
             f"Rode de novo so eles com --cidades/--bairros e --inicio.",
             file=sys.stderr,
         )
+        raise ColetaIncompleta("Uma ou mais listagens falharam.")
 
     return rows
 
@@ -587,7 +770,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--saida", help="Arquivo CSV de saida. Se omitido, usa a data da coleta.")
     parser.add_argument("--limite", type=int, help="Numero maximo de imoveis para capturar.")
     parser.add_argument("--sem-detalhes", action="store_true", help="Nao abrir paginas individuais dos imoveis.")
-    parser.add_argument("--arquivo-listagem", type=Path, help="HTML local de uma listagem para teste.")
+    parser.add_argument("--chrome", action="store_true", help="Coletar pelo Google Chrome visivel (requer playwright).")
+    parser.add_argument("--chrome-nativo", action="store_true",
+                        help="Receber HTML da extensao conectada ao Chrome normal.")
+    parser.add_argument("--arquivo-listagem", type=Path, action="append",
+                        help="HTML salvo no navegador. Repita a opcao para importar varias paginas.")
     parser.add_argument(
         "--escopo",
         choices=["bairros", "todos"],
@@ -599,10 +786,38 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def fetch_native(
+    transport: Callable[[str], str], url: str, retries: int, backoff: float,
+) -> str:
+    for attempt in range(retries + 1):
+        raw = transport(url)
+        soup = make_soup(raw)
+        title = soup.title.get_text().lower() if soup.title else ""
+        challenge = (
+            "just a moment" in title or "um momento" in title
+            or "attention required" in title or soup.select_one("#challenge-form")
+        )
+        if not challenge:
+            return raw
+        if attempt == retries:
+            raise PortalBloqueado(f"Verificacao persistente em {url}")
+        wait = backoff ** (attempt + 1)
+        print(f"Verificacao temporaria em {url}. Aguardando {wait:.0f}s antes de conferir novamente.",
+              file=sys.stderr)
+        time.sleep(wait)
+    raise PortalBloqueado(f"Verificacao solicitada em {url}")
+
+
 def main() -> int:
     args = parse_args()
     if args.inicio < 1 or (args.fim is not None and args.fim < args.inicio):
         raise SystemExit("--inicio deve ser >= 1 e --fim deve ser >= --inicio")
+    if args.chrome_nativo and (args.chrome or args.arquivo_listagem):
+        raise SystemExit("--chrome-nativo deve ser usado com coleta online e sem --chrome")
+    if args.timeout <= 0 or args.delay < 0 or (args.limite is not None and args.limite <= 0):
+        raise SystemExit("--timeout e --limite devem ser positivos; --delay deve ser >= 0")
+    if args.retries < 0:
+        raise SystemExit("--retries deve ser >= 0")
 
     config = ScrapeConfig(
         oferta=args.oferta,
@@ -619,8 +834,62 @@ def main() -> int:
         backoff=args.backoff,
     )
     output_path = Path(args.saida) if args.saida else Path(f"{date.today().isoformat()}.csv")
-    rows = scrape(config, args.arquivo_listagem, output_path)
-    write_csv(rows, output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=output_path.parent, prefix=f"{output_path.stem}_", suffix=".part", delete=False
+    ) as file:
+        checkpoint = Path(file.name)
+    resume = None
+    try:
+        with ExitStack() as resources:
+            if not args.arquivo_listagem:
+                ofertas = ["venda", "aluguel"] if config.oferta == "ambos" else [config.oferta]
+                settings = {
+                    "version": 1, "inicio": config.inicio, "fim": config.fim,
+                    "limite": config.limite, "detalhes": config.detalhes,
+                    "tasks": [build_listing_url(oferta, config.inicio, scope)
+                              for oferta in ofertas for scope in build_scopes(config)],
+                    "fields": CSV_FIELDS,
+                }
+                resume = resources.enter_context(CollectionCheckpoint(output_path, settings))
+                task_index, page = resume.position
+                position = "concluido" if resume.complete else f"busca {task_index + 1}, pagina {page}"
+                print(f"Checkpoint: {resume.path} ({position})", file=sys.stderr)
+            transport = None
+            if resume and resume.complete:
+                print("Coleta ja concluida neste checkpoint. Exportando os dados salvos.", file=sys.stderr)
+                rows = resume.rows()
+            elif args.chrome_nativo:
+                transport = resources.enter_context(ChromeNativeTransport(config.timeout))
+                print("Usando a extensao conectada ao Chrome normal.", file=sys.stderr)
+                download_native = partial(fetch_native, transport,
+                                          retries=config.retries, backoff=config.backoff)
+                rows = scrape_pages(config, None, checkpoint, download_native, strict=True, resume=resume)
+            else:
+                rows = scrape(config, args.arquivo_listagem, checkpoint, chrome=args.chrome, resume=resume)
+            if not rows:
+                raise ColetaIncompleta("Nenhum anuncio encontrado na coleta.")
+            write_csv(rows, checkpoint)
+            checkpoint.replace(output_path)
+            if resume:
+                resume.mark_complete()
+            if transport:
+                transport.complete(len(rows), output_path)
+    except KeyboardInterrupt:
+        print("\nColeta interrompida. Repita o comando para continuar pelo checkpoint.", file=sys.stderr)
+        return 130
+    except (PortalBloqueado, ColetaIncompleta, NativeTransportError, CheckpointError,
+            sqlite3.Error, OSError, json.JSONDecodeError) as exc:
+        bloqueado = isinstance(exc, PortalBloqueado)
+        titulo = "PORTAL BLOQUEADO" if bloqueado else "COLETA INCOMPLETA"
+        print(f"\n=== {titulo} ===\n  {exc}", file=sys.stderr)
+        return SAIDA_PORTAL_BLOQUEADO if bloqueado else 1
+    finally:
+        if checkpoint.exists():
+            if checkpoint.stat().st_size:
+                print(f"  Parcial guardado em {checkpoint}", file=sys.stderr)
+            else:
+                checkpoint.unlink()
     print(f"CSV gerado: {output_path} ({len(rows)} linhas)")
     return 0
 
